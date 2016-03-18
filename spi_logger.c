@@ -3,15 +3,20 @@
  */
 
 #include <stdio.h>
-#include <string.h>
 #include <errno.h>
 #include <stdlib.h>
-#include <stdint.h>
+#include <stdint.h>         // Needs this for uint8_t
 #include <wiringPi.h>
 #include <wiringPiSPI.h>
+#include <mysql/mysql.h>
 
 #define ARRAY_SIZE 0xDC
-#define SPEED 500000
+#define SETTINGS 0x72
+#define HISTORICAL 0x8B
+#define CURRENT 0xAC
+
+#define SPEED 500000        // SPI speed
+#define INT_PIN 24          // BCM pin for interrupt
 
 uint8_t datalog[ARRAY_SIZE];
 
