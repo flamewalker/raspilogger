@@ -16,18 +16,19 @@
 #define INT_PIN 24          // BCM pin for interrupt from AVR
 #define RESET_PIN 25        // BCM pin for reset AVR
 
-#define array_size 0xDC
-#define settings 0x72
-#define systime 0x75
-#define historical 0x8B
-#define current 0xAC
-
 // Watchdog flag to check if SPI connection is alive
 uint8_t conn_alive = 0;
 
 char buff[20];
 
+// Pointers to arrays for storing sample_template and sampled values
+uint8_t *datalog, *sample_template;
+
+uint8_t array_size,settings,systime,historical,current;
+
 // Function declarations
+void init_arrays(void);
+
 void myInterrupt(void);
 
 void finish_with_error(MYSQL *conn);
@@ -35,6 +36,8 @@ void finish_with_error(MYSQL *conn);
 // Main program
 int main(void)
 {
+  init_arrays();
+
   time_t now = time(NULL);
   strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
@@ -46,6 +49,8 @@ int main(void)
     now = time(NULL);
     strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
     fprintf(stderr, "%s %s\n", buff, "Unable to open SPI device 0: %s", strerror(errno));
+    free(datalog);
+    free(sample_template);
     exit(1);
   }
 
@@ -59,6 +64,8 @@ int main(void)
     now = time(NULL);
     strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
     fprintf(stderr, "%s %s\n", buff, "Unable to register ISR: %s", strerror(errno));
+    free(datalog);
+    free(sample_template);
     exit(1);
   }
   fprintf(stdout, "Waiting for interrupt. Press CTRL+C to stop\n");
@@ -80,19 +87,59 @@ int main(void)
   return 0 ;
 }
 
+void init_arrays(void)
+{
+  // Open sample_template file and load fresh values
+  FILE *sp;
+  sp = fopen("/home/pi/spi-logger/sample_template.dat", "r");
+  int data,inc,count;
+  char ch;
+  count=0;
+
+  // First read the size of the sample_template array
+  fscanf(sp,"%x%c", &data, &ch);
+  array_size = data;
+  // Make room for arrays
+  datalog=(uint8_t*)malloc(sizeof(uint8_t)*array_size);
+  sample_template=(uint8_t*)malloc(sizeof(uint8_t)*array_size);
+
+  // Read size of area1
+  fscanf(sp,"%x%c", &data, &ch);
+  settings = data;
+
+  // Read size of area2
+  fscanf(sp,"%x%c", &data, &ch);
+  systime = data;
+
+  // Read size of area3
+  fscanf(sp,"%x%c", &data, &ch);
+  historical = data;
+
+  // Read size of area4
+  fscanf(sp,"%x%c", &data, &ch);
+  current = data;
+
+  // Store sample_template in array
+  while(EOF!=(inc=fscanf(sp,"%x%c", &data, &ch)) && inc == 2)
+    sample_template[count++] = data;
+
+  fclose(sp);
+}
+
 void finish_with_error(MYSQL *conn)
 {
   time_t now = time(NULL);
   strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
   fprintf(stderr, "%s %s %s\n", buff, mysql_error(conn));
   mysql_close(conn);
+  free(datalog);
+  free(sample_template);
   exit(1);
 }
 
 void myInterrupt(void)
 {
   // Array for storing samples
-  uint8_t datalog[array_size];
 
   // String to use for building MySQL query
   char sql_string[500] = "INSERT INTO TIME VALUES(NULL,NULL,NULL,NULL);";
