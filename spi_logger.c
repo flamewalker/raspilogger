@@ -1,8 +1,5 @@
 /*
- * spi_log.c
  * SPI master interface to communicate with I2C datalogger
- * ver 0.1
- * using wiringPi
  */
 
 #include <stdio.h>
