@@ -1,6 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
- * ver 0.8.3
+ * ver 0.8.4
  */
 
 #include <stdio.h>
@@ -13,7 +13,7 @@
 #include <wiringPiSPI.h>	// WiringPi SPI library
 #include <mysql/mysql.h>	// MySQL library
 
-#define PROG_VER "ver 0.8.3"	// Program version
+#define PROG_VER "ver 0.8.4"	// Program version
 #define SPEED 1000000		// SPI speed
 #define INT_PIN 24		// BCM pin for interrupt from AVR
 #define RESET_PIN 25		// BCM pin for reset AVR
