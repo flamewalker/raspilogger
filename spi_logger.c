@@ -1,5 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
+ * ver0.8.0
  */
 
 #include <stdio.h>
@@ -19,15 +20,19 @@
 // Watchdog flag to check if SPI connection is alive
 uint8_t conn_alive = 0;
 
+// Buffer for building datetime in log
 char buff[20];
 
 // Pointers to arrays for storing sample_template and sampled values
 uint8_t *datalog, *sample_template;
 
-uint8_t array_size,settings,systime,historical,current;
+// Variables for keeping track of areas of sampling
+uint8_t array_size,settings,historical,systime,current,alarms;
 
 // Function declarations
 void init_arrays(void);
+
+int find_reg(uint8_t reg);
 
 void myInterrupt(void);
 
@@ -36,13 +41,17 @@ void finish_with_error(MYSQL *conn);
 // Main program
 int main(void)
 {
+  // Create initial space before checking template file and setting actual values
+  datalog=(uint8_t*)malloc(sizeof(uint8_t));
+  sample_template=(uint8_t*)malloc(sizeof(uint8_t));
+
   init_arrays();
 
   time_t now = time(NULL);
   strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
   fprintf(stdout, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
-  fprintf(stderr, "%s %s\n", buff, "Initialize error log. SPI_LOGGER ver 0.8.0");
+  fprintf(stderr, "%s %s\n", buff, "Initialize error log. SPI_LOGGER ver 0.8.1");
 
   if (wiringPiSPISetup (0, SPEED) < 0)
   {
@@ -100,8 +109,8 @@ void init_arrays(void)
   fscanf(sp,"%x%c", &data, &ch);
   array_size = data;
   // Make room for arrays
-  datalog=(uint8_t*)malloc(sizeof(uint8_t)*array_size);
-  sample_template=(uint8_t*)malloc(sizeof(uint8_t)*array_size);
+  datalog=(uint8_t*)realloc(datalog,sizeof(uint8_t)*array_size);
+  sample_template=(uint8_t*)realloc(sample_template,sizeof(uint8_t)*array_size);
 
   // Read size of area1
   fscanf(sp,"%x%c", &data, &ch);
@@ -109,21 +118,36 @@ void init_arrays(void)
 
   // Read size of area2
   fscanf(sp,"%x%c", &data, &ch);
-  systime = data;
+  systime = settings+data;
 
   // Read size of area3
   fscanf(sp,"%x%c", &data, &ch);
-  historical = data;
+  historical = systime+data;
 
   // Read size of area4
   fscanf(sp,"%x%c", &data, &ch);
-  current = data;
+  current = historical+data;
+
+  // Read size of area5
+  fscanf(sp,"%x%c", &data, &ch);
+  alarms = current+data;
 
   // Store sample_template in array
   while(EOF!=(inc=fscanf(sp,"%x%c", &data, &ch)) && inc == 2)
     sample_template[count++] = data;
 
   fclose(sp);
+}
+
+int find_reg(uint8_t reg)
+{
+  int i;
+  for (i = 0 ; i < array_size ; i++)
+  {
+    if (sample_template[i] == reg)
+      return datalog[i];
+  }
+  return 0xFF;
 }
 
 void finish_with_error(MYSQL *conn)
@@ -139,16 +163,14 @@ void finish_with_error(MYSQL *conn)
 
 void myInterrupt(void)
 {
-  // Array for storing samples
-
   // String to use for building MySQL query
-  char sql_string[500] = "INSERT INTO TIME VALUES(NULL,NULL,NULL,NULL);";
+  char sql_string[500];
 
-  // Set watchdog flag for SPI connection alive
+  // Reset watchdog flag for SPI connection alive
   conn_alive = 1;
 
-  // Every C prog must have a x counter...
-  uint8_t x;
+  // Every C prog must have an x counter... and a y variable
+  uint8_t x,y;
 
   // Transmission buffer for SPI, preloaded with SAMPLE_DUMP command
   unsigned char buffer = 0x04;
@@ -162,7 +184,7 @@ void myInterrupt(void)
   {
     time_t now = time(NULL);
     strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
-    fprintf(stderr, "%s %s\n", buff, "Sample collection returned error");
+    fprintf(stderr, "%s %s %d\n", buff, "Sample collection returned error:", buffer);
     return;
   }
 
@@ -172,65 +194,81 @@ void myInterrupt(void)
   int sample_sent = buffer;
 
   // Execute right amount of loops to receive correct number of blocks from AVR
-  if (sample_sent & 8)			// SETTINGS block
+  if (sample_sent & 8)			// SETTINGS block (Area 1)
   {
-    buffer = 0x00;
+    buffer = sample_template[0];
     wiringPiSPIDataRW(0,&buffer,1);
-    for (x = 0x01 ; x <= settings ; x++)
+    for (x = 1 ; x < settings ; x++)
     {
-      buffer = x;
+      buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
     buffer = 0xFE;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
-    datalog[settings] = buffer;
+    datalog[settings-1] = buffer;
   }
 
-  if (sample_sent & 4)			// HISTORICAL block
+  if (sample_sent & 4)			// HISTORICAL block (Area 3)
   {
-    buffer = 0x76;
+    buffer = sample_template[systime];
     wiringPiSPIDataRW(0,&buffer,1);
-    for (x = 0x77 ; x <= historical ; x++)
+    for (x = systime+1 ; x < historical ; x++)
     {
-      buffer = x;
+      buffer =  sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
     buffer = 0xFE;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
-    datalog[historical] = buffer;
+    datalog[historical-1] = buffer;
   }
 
-  if (sample_sent & 2)			// CURRENT block
+  if (sample_sent & 1)			// SYSTIME block (Area 2)
   {
-    buffer = 0x8C;
+    buffer = sample_template[settings];
     wiringPiSPIDataRW(0,&buffer,1);
-    for (x = 0x8D ; x <= current ; x++)
+    for (x = settings+1 ; x < systime; x++)
     {
-      buffer = x;
+      buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
     buffer = 0xFE;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
-    datalog[current] = buffer;
+    datalog[systime-1] = buffer;
   }
 
-  if (sample_sent & 1)			// SYSTIME block
+  if (sample_sent & 2)			// CURRENT block (Area 4)
   {
-    buffer = 0x73;
+    buffer = sample_template[historical];
     wiringPiSPIDataRW(0,&buffer,1);
-    for (x = 0x74 ; x <= systime; x++)
+    for (x = historical+1 ; x < current ; x++)
     {
-      buffer = x;
+      buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
     buffer = 0xFE;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
-    datalog[systime] = buffer;
+    datalog[current-1] = buffer;
   }
+
+  if (sample_sent & 16)			// ALARMS block (Area 5)
+  {
+    buffer = sample_template[current];
+    wiringPiSPIDataRW(0,&buffer,1);
+    for (x = current+1 ; x < alarms ; x++)
+    {
+      buffer = sample_template[x];
+      wiringPiSPIDataRW(0,&buffer,1);
+      datalog[x-1] = buffer;
+    }
+    buffer = 0xFE;			// Send as NO-OP
+    wiringPiSPIDataRW(0,&buffer,1);
+    datalog[alarms-1] = buffer;
+  }
+
 
   buffer = 0xAD;			// End sample sending
   wiringPiSPIDataRW(0,&buffer,1);
@@ -239,29 +277,29 @@ void myInterrupt(void)
   FILE *fp;
 
   // SYSTIME table
-  if (sample_sent & 1)
-    sprintf(sql_string, "INSERT INTO TIME VALUES(NULL,NULL,'%02u:%02u',%u);", datalog[0x74], datalog[0x75], datalog[0x73]);
+  sprintf(sql_string, "INSERT INTO TIME VALUES(NULL,NULL,'%02u:%02u',%u,%u);", datalog[systime-4], datalog[systime-3], datalog[systime-2], datalog[systime-1]);
 
   // SETTINGS table
   if (sample_sent & 8)
   {
     fp = fopen("/tmp/settings.csv", "w");
     fprintf(fp,"NULL,%f,", (float)datalog[0]/2);
-    for (x = 1 ; x < settings ; x++)
+    for (x = 1 ; x < settings-1 ; x++)
     {
-      if (x ==0x06 || x ==0x07 || x == 0x13 || x == 0x15 || x == 0x1E || x == 0x1F || x == 0x3A || x== 0x41)
+      y = sample_template[x];
+      if (y ==0x06 || y ==0x07 || y == 0x13 || y == 0x15 || y == 0x1E || y == 0x1F || y == 0x3A || y == 0x41)
         fprintf(fp, "%d,", datalog[x]-40);
       else
-	if (x == 0x31)
+	if (y == 0x31)
 	{
 	  fprintf(fp, "%u0,%u0,%u0,", datalog[x], datalog[x+1], datalog[x+2]);
-	  x = 0x33;
+	  x = x+2;
 	}
 	else
-          if (x == 0x16)
+          if (y == 0x16)
 	  {
             fprintf(fp, "%u%u%u,", datalog[x], datalog[x+1], datalog[x+2]);
- 	    x=0x18;
+ 	    x = x+2;
 	  }
           else
             fprintf(fp, "%u,", datalog[x]);
@@ -276,14 +314,13 @@ void myInterrupt(void)
   {
     fp = fopen("/tmp/historical.csv", "w");
     fprintf(fp,"NULL,");
-    fprintf(fp,"%02u%02u%02u,", datalog[0x78],datalog[0x77],datalog[0x76]);
-    fprintf(fp,"%02u%02u%02u,", datalog[0x7B],datalog[0x7A],datalog[0x79]);
-    for (x=0x7C ; x < 0x85 ; x++)
-        fprintf(fp, "%u," , datalog[x]);
-    fprintf(fp,"%02u:%02u,", datalog[0x86],datalog[0x85]);
-    fprintf(fp,"%u,", datalog[0x87]);
-    fprintf(fp,"%02u%02u%02u,", datalog[0x8A],datalog[0x89],datalog[0x88]);
-    fprintf(fp, "%u", datalog[0x8B]);
+    fprintf(fp,"%02u%02u%02u,", find_reg(0x78),find_reg(0x77),find_reg(0x76));
+    fprintf(fp,"%u,", find_reg(0x87));
+    fprintf(fp,"%02u%02u%02u,", find_reg(0x7B),find_reg(0x7A),find_reg(0x79));
+    fprintf(fp,"%02u:%02u,", find_reg(0x86),find_reg(0x85));
+    for (x=0x7F ; x < 0x84 ; x++)
+        fprintf(fp, "%u," , find_reg(x));
+    fprintf(fp,"%u", find_reg(0x84));
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/historical.csv' INTO TABLE HISTORICAL FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
   }
@@ -293,18 +330,20 @@ void myInterrupt(void)
   {
     fp = fopen("/tmp/current.csv", "w");
     fprintf(fp,"NULL,");
-    for (x=historical+1 ; x < current-2 ; x++)
+    for (x=historical ; x < current-1 ; x++)
     {
-      if (x == 0x8E || x == 0x94 || x == 0x95)
+      y = sample_template[x];
+      if (y == 0x8E || y == 0x94 || y == 0x95)
         fprintf(fp, "%d," , datalog[x]-40);
       else
-        if (x == 0x8F)
-          fprintf(fp, "%f,", (float)datalog[x++]+((float)datalog[x+1]/10));
+        if (y == 0x8F)
+          fprintf(fp, "%u.%u,", datalog[x++], datalog[x]);
         else
-          fprintf(fp, "%u," , datalog[x]);
+          if (y == 0xAA)
+            fprintf(fp, "%f,", (float)datalog[x]/2);
+          else
+            fprintf(fp, "%u," , datalog[x]);
     }
-    fprintf(fp, "%f,", (float)datalog[x++]/2);
-    fprintf(fp, "%u,", datalog[x++]);
     fprintf(fp, "%u", datalog[x]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/current.csv' INTO TABLE CURRENT FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
