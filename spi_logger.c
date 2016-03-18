@@ -34,7 +34,7 @@ int main (void)
 
   printf("Starting\n");
   wiringPiSetupGpio();
-  wiringPiISR (24, INT_EDGE_RISING, &myInterrupt) ;
+  wiringPiISR (INT_PIN, INT_EDGE_RISING, &myInterrupt) ;
   printf("Waiting for interrupt. Press CTRL+C to stop\n");
   for (;;)
   {
@@ -43,14 +43,25 @@ int main (void)
   return 0 ;
 }
 
-void myInterrupt (void)
+void myInterrupt(void)
 {
+  FILE *fp;
+  MYSQL *conn;
+  conn = mysql_init(NULL);
+  MYSQL_RES *res;
+  MYSQL_ROW row;
+  char *server = "localhost";
+  char *user = "xxxxxx";
+  char *password = "xxxxxxx";
+  char *database = "ctclog";
+
   uint8_t x;
-  unsigned char buffer;
-  buffer = 0x04;
+  unsigned char buffer = 0x04;
+  
   wiringPiSPIDataRW(0,&buffer,1);
   buffer = 0x00;
   wiringPiSPIDataRW(0,&buffer,1);
+  
   for (x = 1; x < ARRAY_SIZE; x++)
   {
     buffer = x;
@@ -60,4 +71,54 @@ void myInterrupt (void)
   buffer = 0xFF;
   wiringPiSPIDataRW(0,&buffer,1);
   datalog[0xDB] = buffer;
+  
+  fp = fopen("settings.csv", "w+");
+  for (x = 0; x < SETTINGS ; x++)
+    fprintf(fp, "%d,", datalog[x]);
+  fprintf(fp, "%d", datalog[x++]);
+  fclose(fp);
+
+  fp = fopen("historical.csv", "w+");
+  for (; x < HISTORICAL ; x++)
+    fprintf(fp, "%d," , datalog[x]);
+  fprintf(fp, "%d", datalog[x++]);
+  fclose(fp);
+
+  fp = fopen("current.csv", "w+");
+  for (; x < CURRENT ; x++)
+    fprintf(fp, "%d," , datalog[x]);
+  fprintf(fp, "%d", datalog[x]);
+  fclose(fp);
+
+  if (!mysql_real_connect(conn, server, user, password, database, 0, NULL, 0))
+  {
+    fprintf(stderr, "%s\n", mysql_error(conn));
+    exit(1);
+  }
+
+  if (mysql_query(conn, "LOAD DATA INFILE 'settings.csv' INTO TABLE SETTINGS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n'"))
+  {
+    fprintf(stderr, "%s\n", mysql_error(conn));
+    exit(1);
+  }
+
+  if (mysql_query(conn, "LOAD DATA INFILE 'historical.csv' INTO TABLE SETTINGS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n'"))
+  {
+    fprintf(stderr, "%s\n", mysql_error(conn));
+    exit(1);
+  }
+
+  if (mysql_query(conn, "LOAD DATA INFILE 'current.csv' INTO TABLE SETTINGS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n'"))
+  {
+    fprintf(stderr, "%s\n", mysql_error(conn));
+    exit(1);
+  }
+
+  if (mysql_query(conn, "INSERT INTO TIME VALUES(CURDATE(),CURTIME())"))
+  {
+    fprintf(stderr, "%s\n", mysql_error(conn));
+    exit(1);
+  }
+
+  mysql_close(conn);
 }
