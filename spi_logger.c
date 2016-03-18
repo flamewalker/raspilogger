@@ -229,6 +229,10 @@ void myInterrupt(void)
   wiringPiSPIDataRW(0,&buffer,1);
   int sample_sent = buffer;
 
+  // If SYSTIME has changed, make sure we get a CURRENT sample also
+  if (sample_sent & 1)
+    sample_sent |= 2;
+
   // Execute right amount of loops to receive correct number of blocks from AVR
   if (sample_sent & 8)			// SETTINGS block (Area 1)
   {
@@ -335,13 +339,6 @@ void myInterrupt(void)
     datalog[current-1] = buffer;
   }
 
-  // Fix until AVR prog changes, after that delete this!
-  if (sample_sent & 2)
-    sample_sent |= 80;
-  if (sample_sent & 4)
-    sample_sent |= 32;
-  //
-
   buffer = 0xAD;			// End sample sending
   wiringPiSPIDataRW(0,&buffer,1);
 
@@ -401,7 +398,7 @@ void myInterrupt(void)
   {
     fp = fopen("/tmp/current.csv", "w");
     fprintf(fp,"NULL,");
-    for (x=historical+4 ; x < current-5 ; x++)
+    for (x=historical ; x < current-1 ; x++)
     {
       y = sample_template[x];
       if (y == 0x8E || y == 0x94 || y == 0x95)
@@ -425,7 +422,7 @@ void myInterrupt(void)
   {
     fp = fopen("/tmp/alarms.csv", "w");
     fprintf(fp,"NULL,");
-    fprintf(fp, "%u,%u,%u,%u", datalog[current-4],datalog[current-3],datalog[current-2],datalog[current-1]);
+    fprintf(fp, "%u,%u,%u,%u", datalog[alarms-4],datalog[alarms-3],datalog[alarms-2],datalog[alarms-1]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/alarms.csv' INTO TABLE ALARMS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
   }
@@ -445,7 +442,7 @@ void myInterrupt(void)
   {
     fp = fopen("/tmp/status.csv", "w");
     fprintf(fp,"NULL,");
-    fprintf(fp, "%u,%u,%u,%u", datalog[historical],datalog[historical+1],datalog[historical+2],datalog[historical+3]);
+    fprintf(fp, "%u,%u,%u,%u", datalog[status-4],datalog[status-3],datalog[status-2],datalog[status-1]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/status.csv' INTO TABLE STATUS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
   }
