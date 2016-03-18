@@ -182,9 +182,12 @@ void myInterrupt(void)
   // Check if SAMPLE_DUMP command was acknowledged
   if (buffer != 0x04)
   {
-    time_t now = time(NULL);
-    strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
-    fprintf(stderr, "%s %s %d\n", buff, "Sample collection returned error:", buffer);
+    if (buffer != 0x01)
+    {
+       time_t now = time(NULL);
+       strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
+       fprintf(stderr, "%s %s %d\n", buff, "Sample collection returned error:", buffer);
+    }
     return;
   }
 
