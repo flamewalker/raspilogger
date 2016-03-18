@@ -4,21 +4,22 @@
  */
 
 #include <stdio.h>
-#include <errno.h>		// For translating errno to plain text
+#include <errno.h>				// For translating errno to plain text
 #include <stdlib.h>
-#include <stdint.h>		// Needs this for uint8_t
-#include <time.h>		// Need this for time in logs
+#include <stdint.h>				// Needs this for uint8_t
+#include <time.h>				// Need this for time in logs
 #include <string.h>
-#include <wiringPi.h>		// WiringPi GPIO library
-#include <wiringPiSPI.h>	// WiringPi SPI library
-#include <mysql/mysql.h>	// MySQL library
-#include <fcntl.h>		// Need this for named pipes
+#include <wiringPi.h>				// WiringPi GPIO library
+#include <wiringPiSPI.h>			// WiringPi SPI library
+#include <mysql/mysql.h>			// MySQL library
+#include <fcntl.h>				// Need this for named pipes
 
-#define PROG_VER "ver 0.8.6" 	// Program version
-#define SPEED 2000000		// SPI speed
-#define INT_PIN 25		// BCM pin for interrupt from AVR
-#define RESET_PIN 24		// BCM pin for reset AVR
-#define FIFO_NAME "ctc_cmd"	// The named pipe
+#define PROG_VER "ver 0.8.6" 			// Program version
+#define SPEED 2000000				// SPI speed
+#define INT_PIN 25				// BCM pin for interrupt from AVR
+#define RESET_PIN 24				// BCM pin for reset AVR
+#define FIFO_NAME "ctc_cmd"			// The named pipe
+#define SAMPLE_TEMPLATE "sample_template.dat"	// The sample template file
 
 // Watchdog flag to check if SPI connection is alive
 uint8_t conn_alive = 0;
@@ -279,7 +280,7 @@ void init_arrays(void)
 {
   // Open sample_template file and load fresh values
   FILE *sp;
-  sp = fopen("/home/pi/spi-logger/sample_template.dat", "r");
+  sp = fopen(SAMPLE_TEMPLATE, "r");
   int data,inc,count = 0;
   char ch;
 
