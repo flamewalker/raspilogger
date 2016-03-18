@@ -1,6 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
- * ver 0.8.1
+ * ver 0.8.2
  */
 
 #include <stdio.h>
@@ -51,7 +51,7 @@ int main(void)
   strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
   fprintf(stdout, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
-  fprintf(stderr, "%s %s\n", buff, "Initialize error log. SPI_LOGGER ver 0.8.1");
+  fprintf(stderr, "%s %s\n", buff, "Initialize error log. SPI_LOGGER ver 0.8.2");
 
   if (wiringPiSPISetup (0, SPEED) < 0)
   {
