@@ -20,35 +20,7 @@
 
 uint8_t datalog[ARRAY_SIZE];
 
-/*
- * myInterrupt:
- *********************************************************************************
- */
-
-void myInterrupt (void)
-{
-  uint8_t x;
-  unsigned char buffer;
-  buffer = 0x04;
-  wiringPiSPIDataRW(0,&buffer,1);
-  buffer = 0x00;
-  wiringPiSPIDataRW(0,&buffer,1);
-  for (x = 1; x < ARRAY_SIZE; x++)
-  {
-    buffer = x;
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[x-1] = buffer;
-  }
-  buffer = 0xFF;
-  wiringPiSPIDataRW(0,&buffer,1);
-  datalog[0xDB] = buffer;
-}
-
-/*
- *********************************************************************************
- * main
- *********************************************************************************
- */
+void myInterrupt(void);
 
 int main (void)
 {
@@ -69,4 +41,23 @@ int main (void)
 
   }
   return 0 ;
+}
+
+void myInterrupt (void)
+{
+  uint8_t x;
+  unsigned char buffer;
+  buffer = 0x04;
+  wiringPiSPIDataRW(0,&buffer,1);
+  buffer = 0x00;
+  wiringPiSPIDataRW(0,&buffer,1);
+  for (x = 1; x < ARRAY_SIZE; x++)
+  {
+    buffer = x;
+    wiringPiSPIDataRW(0,&buffer,1);
+    datalog[x-1] = buffer;
+  }
+  buffer = 0xFF;
+  wiringPiSPIDataRW(0,&buffer,1);
+  datalog[0xDB] = buffer;
 }
