@@ -32,6 +32,9 @@ uint8_t int_active = 0;
 // Pointers to arrays for storing sample_template and sampled values
 uint8_t *datalog, *sample_template;
 
+// OneWire temperature array
+uint8_t temperaturearray[20];
+
 // Variables for keeping track of areas of sampling
 uint8_t array_size,settings,historical,systime,current,alarms,last24h,status;
 
@@ -44,11 +47,17 @@ int readfd;
 // Function declarations
 void send_command(int, int);
 
+void debug_msg(void);
+
 int trySPIcon(void);
 
 void init_arrays(void);
 
 int find_reg(uint8_t);
+
+uint8_t get_sample(uint8_t, uint8_t);
+
+uint8_t get_onewire(uint8_t, uint8_t);
 
 void myInterrupt(void);
 
@@ -105,18 +114,29 @@ int main(void)
     exit(EXIT_FAILURE);
   }
 
+  // Start by sending command to set SMS = 1
+//  send_command(0xDE, 0x01);
+
   // Endless loop waiting for IRQ
   fprintf(stdout, "Waiting for interrupt. Press CTRL+C to stop\n");
+
+  while (conn_alive == 0)
+  {
+  }
 
   while (1)
   {
     sleep(65);
     if (conn_alive == 1)	// Check if the SPI communication has been active in the last 65 seconds
+    {
       conn_alive = 0;
+//      debug_msg();
+    }
     else
     {
       if (trySPIcon() == 0)
       {
+	debug_msg();
         error_log("SPI connection has not been in use for last 130 seconds, reset AVR!","");
         digitalWrite(RESET_PIN, LOW);
         sleep(1);
@@ -125,13 +145,13 @@ int main(void)
       }
     }
   }
-  return 0;
+  exit(EXIT_FAILURE);
 }
 
 void send_command(int cmd, int arg)
 {
   char buf[3];
-  sprintf(buf,"%X", cmd);
+  sprintf(buf,"%02X", cmd);
   error_log("Command:", buf);
   buffer = 0xF1;			// Start COMMAND sequence
   wiringPiSPIDataRW(0,&buffer,1);
@@ -139,7 +159,7 @@ void send_command(int cmd, int arg)
   wiringPiSPIDataRW(0,&buffer,1);
   if (buffer == 0xF1)
   {
-    sprintf(buf,"%X", arg);
+    sprintf(buf,"%02X", arg);
     error_log("Argument:", buf);
     buffer = arg;			// Send arg
     wiringPiSPIDataRW(0,&buffer,1);
@@ -150,17 +170,58 @@ void send_command(int cmd, int arg)
     error_log("Success!","");
   else
   {
-    sprintf(buf,"%X", buffer);
+    sprintf(buf,"%02X", buffer);
     error_log("Failure!", buf);
   }
+}
+void debug_msg(void)
+{
+   char buf[3];
+    // Load SPI transmission buffer
+    buffer = 0xF2;				// Load with F2 to request variable sample_send
+    wiringPiSPIDataRW(0,&buffer,1);		// Send first command and recieve whatever is in the buffer
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, expect 0xAD:",buf);	// Should be 0xAD if previous sample was successfull
+    buffer = 0xF3;				// Load with 0xF3 to request variable i2c_state
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%u",buffer);
+    error_log("Debug_msg, sample_done=:",buf);
+    buffer = 0xF4;				// Load with F4 to request i2c_nextcmd[0]
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%u",buffer);
+    error_log("Debug_msg, i2c_state=:",buf);
+    buffer = 0xF5;				// Load with F5 to request i2c_nextcmd[1]
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, i2c_nextcmd[0]=:",buf);
+    buffer = 0xF6;				// Load with F6 to request sample_pending
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, i2c_nextcmd[1]=:",buf);
+    buffer = 0xF7;				// Load with F7 to request test2
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%u",buffer);
+    error_log("Debug_msg, sample_pending=:",buf);
+    buffer = 0xF8;				// Load with F8 to request slask
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%u",buffer);
+    error_log("Debug_msg, test2=:",buf);
+    buffer = 0xF9;				// Load with F9 to request count
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, slask=:",buf);
+    buffer = 0xFA;				// Load with FA to command start_sample = true
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, count=:",buf);
+    buffer = 0xFF;				// Load with FF to send PING
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, I2C_SAMPLE cmd sent:",buf);
 }
 
 int trySPIcon(void)
 {
-  // Increase the number of times we have come here and break if more than 0
-  if (error_count++ > 0)
-    return 0;
-
   // Buffer for passing error code (int) to function (char)
   char buf[3];
 
@@ -173,13 +234,17 @@ int trySPIcon(void)
   }
   else
   {
-    // Load SPI transmission buffer with PING
-    buffer = 0xFF;
+    // Increase the number of times we have come here and break if more than 0
+    if (error_count++ > 0)
+      return 0;
 
-    wiringPiSPIDataRW(0,&buffer,1);	// Send first command and recieve whatever is in the buffer
-    buffer = 0xFF;			// Load with 0xFF again to PING
-    wiringPiSPIDataRW(0,&buffer,1);	// Buffer should contain answer to previous send command
+    debug_msg();
 
+    // Check SPI transmission
+    buffer = 0xFF;				// Load with FF to send PING
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command, probably 0xAD if previos sample was OK
+    buffer = 0xFF;				// Load with FF to send PING
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
     switch(buffer)
     {
       case 0x00:
@@ -282,8 +347,82 @@ void finish_with_error(MYSQL *conn)
   exit(1);
 }
 
+uint8_t test_spi(uint8_t val)
+{
+  buffer = 0xFF;
+  wiringPiSPIDataRW(0,&buffer,1);
+  buffer = sample_template[val];
+  wiringPiSPIDataRW(0,&buffer,1);
+  if (buffer == 0x01)
+    return 0;
+  else
+    return 1;
+}
+
+uint8_t get_sample(uint8_t start, uint8_t stop)
+{
+  buffer = sample_template[start];
+  wiringPiSPIDataRW(0,&buffer,1);
+  if (buffer == 0x01)
+    if (test_spi(start) == 0)
+    {
+      // Buffer for passing error code (int) to function (char)
+      char buf[3];
+      sprintf(buf,"%02X", stop);
+      error_log("Get_sample: No sample available error!", buf);
+      int_active = 0;
+      return 0;
+    }
+
+  // Every C prog must have an x counter
+  uint8_t x;
+
+  for (x = start+1 ; x < stop ; x++)
+  {
+    buffer =  sample_template[x];
+    wiringPiSPIDataRW(0,&buffer,1);
+    datalog[x-1] = buffer;
+  }
+  buffer = 0xFF;			// Send as NO-OP
+  wiringPiSPIDataRW(0,&buffer,1);
+  datalog[stop-1] = buffer;
+  return 1;
+}
+
+uint8_t get_onewire(uint8_t start, uint8_t stop)
+{
+  buffer = 0xB0 + start;
+  wiringPiSPIDataRW(0,&buffer,1);
+  if (buffer == 0x01)
+    if (test_spi(start) == 0)
+    {
+      // Buffer for passing error code (int) to function (char)
+      char buf[3];
+      sprintf(buf,"%02X", stop);
+      error_log("Get_onewire: No sample available error!", buf);
+      int_active = 0;
+      return 0;
+    }
+
+  // Every C prog must have an x counter
+  uint8_t x;
+
+  for (x = start+1 ; x < stop ; x++)
+  {
+    buffer = 0xB0 + x;
+    wiringPiSPIDataRW(0,&buffer,1);
+    temperaturearray[x-1] = buffer;
+  }
+  buffer = 0xFF;
+  wiringPiSPIDataRW(0,&buffer,1);
+  temperaturearray[stop-1] = buffer;
+  return 1;
+}
+
 void myInterrupt(void)
 {
+  char buf[3];
+
   // Check if we somehow have called this procedure already...
   if (int_active == 1)
   {
@@ -291,25 +430,70 @@ void myInterrupt(void)
     return;
   }
 
+  // Check if the signal pin is high, if not something is wrong...
+  if (digitalRead(INT_PIN) == 0)
+  {
+    error_log("Interrupt pin is not active!","");
+    return;
+  }
   // Set watchdog flag to indicate we're handling this IRQ
   int_active = 1;
 
   // Load SPI buffer with SAMPLE_DUMP command
   buffer = 0xF0;
-
   wiringPiSPIDataRW(0,&buffer,1);	// Send first command and recieve whatever is in the buffer
+
+  if (buffer != 0xAD && buffer != 0x01)
+  {
+    sprintf(buf,"%02X",buffer);
+    error_log("Throwaway value:", buf);
+  }
+
   buffer = 0xFE;			// Load with 0xFE to command next reply to be how many blocks to expect, if any
   wiringPiSPIDataRW(0,&buffer,1);	// Buffer should contain answer to previous send command
+
+  // Reset watchdog flags for SPI connection alive
+  conn_alive = 1;
+  error_count = 0;
 
   // Check if SAMPLE_DUMP command was acknowledged
   if (buffer != 0xF0)
   {
-    // Buffer for passing error code (int) to function (char)
-    char buf[3];
-    sprintf(buf,"%u",buffer);
-    error_log("Sample collection returned error:", buf);
-    int_active = 0;
-    return;
+
+    if (buffer != 0xF0)
+    {
+      sprintf(buf,"%02X",buffer);
+      error_log("SAMPLE_DUMP not ack'd:", buf);
+    }
+    buffer = 0xFF;
+    wiringPiSPIDataRW(0,&buffer,1);	// Send first command and recieve whatever is in the buffer
+
+    if (buffer != 0xFE)
+    {
+    sprintf(buf,"%02X",buffer);
+    error_log("Expect FE:", buf);
+    }
+
+    buffer = 0xFE;			// Load with 0xFE to command next reply to be how many blocks to expect, if any
+    wiringPiSPIDataRW(0,&buffer,1);	// Buffer should contain answer to previous send command
+
+    if (buffer != 0xFF)
+    {
+    sprintf(buf,"%02X",buffer);
+    error_log("Expect FF:", buf);
+    }
+
+    if (buffer != 0xFF)
+    {
+      // Buffer for passing error code (int) to function (char)
+      char buf[3];
+      sprintf(buf,"%02X",buffer);
+      error_log("Sample collection returned error:", buf);
+      int_active = 0;
+      buffer = 0xAD;
+      wiringPiSPIDataRW(0,&buffer,1);
+      return;
+    }
   }
 
   // String to use for building MySQL query
@@ -318,12 +502,13 @@ void myInterrupt(void)
   // Every C prog must have an x counter... and a y variable
   uint8_t x,y;
 
-  // Reset watchdog flag for SPI connection alive
-  conn_alive = 1;
-
   // Check how many blocks to expect from AVR
   buffer = 0xFF;			// Send as NO-OP / PING
   wiringPiSPIDataRW(0,&buffer,1);
+
+//    sprintf(buf,"%u",buffer);
+//    error_log("Reached sample_sent=:", buf);
+
   int sample_sent = buffer;
 
   // If SYSTIME has changed, make sure we get a CURRENT sample also
@@ -332,151 +517,26 @@ void myInterrupt(void)
 
   // Execute right amount of loops to receive correct number of blocks from AVR
   if (sample_sent & 1)			// SYSTIME block (Area 2)
-  {
-    buffer = sample_template[settings];
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == 0x01)
-    {
-      error_log("No sample available error!", "systime");
-      int_active = 0;
+    if(!get_sample(settings, systime))
       return;
-    }
-    for (x = settings+1 ; x < systime; x++)
-    {
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFF;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[systime-1] = buffer;
-  }
-
-  if (sample_sent & 8)			// SETTINGS block (Area 1)
-  {
-    buffer = sample_template[0];
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == 0x01)
-    {
-      error_log("No sample available error!", "settings");
-      int_active = 0;
-      return;
-    }
-    for (x = 1 ; x < settings ; x++)
-    {
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFF;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[settings-1] = buffer;
-  }
-
-  if (sample_sent & 16)			// ALARMS block (Area 5)
-  {
-    buffer = sample_template[current];
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == 0x01)
-    {
-      error_log("No sample available error!", "alarms");
-      int_active = 0;
-      return;
-    }
-    for (x = current+1 ; x < alarms ; x++)
-    {
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFF;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[alarms-1] = buffer;
-  }
-
-  if (sample_sent & 32)			// LAST_24H block (Area 6)
-  {
-    buffer = sample_template[alarms];
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == 0x01)
-    {
-      error_log("No sample available error!", "last_24h");
-      int_active = 0;
-      return;
-    }
-    for (x = alarms+1 ; x < last24h ; x++)
-    {
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFF;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[last24h-1] = buffer;
-  }
-
-  if (sample_sent & 64)			// STATUS block (Area 7)
-  {
-    buffer = sample_template[last24h];
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == 0x01)
-    {
-      error_log("No sample available error!", "status");
-      int_active = 0;
-      return;
-    }
-    for (x = last24h+1 ; x < status ; x++)
-    {
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFF;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[status-1] = buffer;
-  }
-
-  if (sample_sent & 4)			// HISTORICAL block (Area 3)
-  {
-    buffer = sample_template[systime];
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == 0x01)
-    {
-      error_log("No sample available error!", "historical");
-      int_active = 0;
-      return;
-    }
-    for (x = systime+1 ; x < historical ; x++)
-    {
-      buffer =  sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFF;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[historical-1] = buffer;
-  }
-
   if (sample_sent & 2)			// CURRENT block (Area 4)
-  {
-    buffer = sample_template[historical];
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == 0x01)
-    {
-      error_log("No sample available error!", "current");
-      int_active = 0;
+    if(!get_sample(historical, current) || !get_onewire(0, 2))
       return;
-    }
-    for (x = historical+1 ; x < current ; x++)
-    {
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFF;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[current-1] = buffer;
-  }
+  if (sample_sent & 4)			// HISTORICAL block (Area 3)
+    if(!get_sample(systime, historical))
+      return;
+  if (sample_sent & 8)			// SETTINGS block (Area 1)
+    if(!get_sample(0, settings))
+      return;
+  if (sample_sent & 16)			// ALARMS block (Area 5)
+    if(!get_sample(current, alarms))
+      return;
+  if (sample_sent & 32)			// LAST_24H block (Area 6)
+    if(!get_sample(alarms, last24h))
+      return;
+  if (sample_sent & 64)			// STATUS block (Area 7)
+    if(!get_sample(last24h, status))
+      return;
 
   buffer = 0xAD;			// End sample sending
   wiringPiSPIDataRW(0,&buffer,1);
@@ -513,7 +573,7 @@ void myInterrupt(void)
   if (sample_sent & 8)
   {
     fp = fopen("/tmp/settings.csv", "w");
-    fprintf(fp,"NULL,%f,", (float)datalog[0]/2);
+    fprintf(fp,"NULL,%.1f,", (float)datalog[0]/2);
     for (x = 1 ; x < settings-1 ; x++)
     {
       y = sample_template[x];
@@ -569,13 +629,19 @@ void myInterrupt(void)
           fprintf(fp, "%u.%u,", datalog[x++], datalog[x]);
         else
           if (y == 0xAA)
-            fprintf(fp, "%f,", (float)datalog[x]/2);
+            fprintf(fp, "%.1f,", (float)datalog[x]/2);
           else
             fprintf(fp, "%u," , datalog[x]);
     }
     fprintf(fp, "%u", datalog[x]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/current.csv' INTO TABLE CURRENT FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+
+    fp = fopen("/tmp/onewire.csv", "w");
+    fprintf(fp,"NULL,");
+    fprintf(fp, "%u.%02u", temperaturearray[0], temperaturearray[1]);
+    fclose(fp);
+    strcat(sql_string, "LOAD DATA INFILE '/tmp/onewire.csv' INTO TABLE ONEWIRE FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
   }
 
   // ALARMS table
