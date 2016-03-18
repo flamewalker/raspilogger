@@ -1,6 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
- * ver0.8.0
+ * ver 0.8.0
  */
 
 #include <stdio.h>
