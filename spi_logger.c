@@ -4,7 +4,7 @@
  */
 
 #include <stdio.h>
-#include <errno.h>
+#include <errno.h>		// For translating errno to plain text
 #include <stdlib.h>
 #include <stdint.h>		// Needs this for uint8_t
 #include <time.h>		// Need this for time in logs
@@ -12,14 +12,19 @@
 #include <wiringPi.h>		// WiringPi GPIO library
 #include <wiringPiSPI.h>	// WiringPi SPI library
 #include <mysql/mysql.h>	// MySQL library
+#include <fcntl.h>		// Need this for named pipes
 
-#define PROG_VER "ver 0.8.4"	// Program version
-#define SPEED 1000000		// SPI speed
-#define INT_PIN 24		// BCM pin for interrupt from AVR
-#define RESET_PIN 25		// BCM pin for reset AVR
+#define PROG_VER "ver 0.8.4" 	// Program version
+#define SPEED 2000000		// SPI speed
+#define INT_PIN 25		// BCM pin for interrupt from AVR
+#define RESET_PIN 24		// BCM pin for reset AVR
+#define FIFO_NAME "ctc_cmd"	// The named pipe
 
 // Watchdog flag to check if SPI connection is alive
 uint8_t conn_alive = 0;
+
+// Error counter for SPI connection
+uint8_t error_count = 0;
 
 // Watchdog flag to block interrupt firing more than once
 uint8_t int_active = 0;
@@ -30,10 +35,20 @@ uint8_t *datalog, *sample_template;
 // Variables for keeping track of areas of sampling
 uint8_t array_size,settings,historical,systime,current,alarms,last24h,status;
 
+// Transmission buffer for SPI (usable all over the place...)
+unsigned char buffer = 0x00;
+
+// Handle for named pipe
+int readfd;
+
 // Function declarations
+void send_command(int, int);
+
+int trySPIcon(void);
+
 void init_arrays(void);
 
-int find_reg(uint8_t reg);
+int find_reg(uint8_t);
 
 void myInterrupt(void);
 
@@ -44,6 +59,10 @@ void error_log(char *log_message, char *error_str);
 // Main program
 int main(void)
 {
+  // Greeting message to signal we're alive
+  fprintf(stdout, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
+  error_log("Initialize error log. SPI_LOGGER",PROG_VER);
+
   // Initialize GPIO
   wiringPiSetupGpio();
   pinMode(RESET_PIN, OUTPUT);
@@ -51,22 +70,27 @@ int main(void)
   pinMode(INT_PIN, INPUT);
   pullUpDnControl(INT_PIN, PUD_DOWN);
 
+  // Initialize SPI communication
+  if (wiringPiSPISetup(0, SPEED) < 0)
+  {
+    error_log("Unable to open SPI device 0:", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  // Initialize the FIFO for commands
+  if (access(FIFO_NAME, F_OK) == -1)		// Check if FIFO already exists
+    if (mkfifo(FIFO_NAME, 0777) != 0)		// If not, then create FIFO
+    {
+      error_log("Could not create fifo:", FIFO_NAME);
+      exit(EXIT_FAILURE);
+    }
+  readfd = open(FIFO_NAME, O_RDONLY | O_NONBLOCK);	// Open FIFO in read-only, non-blocking mode
+
   // Create initial space before checking template file and setting actual values
   datalog=(uint8_t*)malloc(sizeof(uint8_t));
   sample_template=(uint8_t*)malloc(sizeof(uint8_t));
 
   init_arrays();
-
-  fprintf(stdout, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
-  error_log("Initialize error log. SPI_LOGGER",PROG_VER);
-
-  if (wiringPiSPISetup(0, SPEED) < 0)
-  {
-    error_log("Unable to open SPI device 0:", strerror(errno));
-    free(datalog);
-    free(sample_template);
-    exit(1);
-  }
 
   // Check if a sample is available before initializing interrupt and wait loop
   if (digitalRead(INT_PIN) == 1)
@@ -78,11 +102,12 @@ int main(void)
     error_log("Unable to register ISR:", strerror(errno));
     free(datalog);
     free(sample_template);
-    exit(1);
+    exit(EXIT_FAILURE);
   }
-  fprintf(stdout, "Waiting for interrupt. Press CTRL+C to stop\n");
 
   // Endless loop waiting for IRQ
+  fprintf(stdout, "Waiting for interrupt. Press CTRL+C to stop\n");
+
   while (1)
   {
     sleep(65);
@@ -90,13 +115,87 @@ int main(void)
       conn_alive = 0;
     else
     {
-      error_log("SPI connection has not been in use for last 65 seconds, reset AVR!","");
-      digitalWrite(RESET_PIN, LOW);
-      sleep(1);
-      digitalWrite(RESET_PIN, HIGH);
+      if (trySPIcon() == 0)
+      {
+        error_log("SPI connection has not been in use for last 130 seconds, reset AVR!","");
+        digitalWrite(RESET_PIN, LOW);
+        sleep(1);
+        digitalWrite(RESET_PIN, HIGH);
+        error_count = 0;
+      }
     }
   }
-  return 0 ;
+  return 0;
+}
+
+void send_command(int cmd, int arg)
+{
+  char buf[3];
+  sprintf(buf,"%X", cmd);
+  error_log("Command:", buf);
+  buffer = 0xF1;			// Start COMMAND sequence
+  wiringPiSPIDataRW(0,&buffer,1);
+  buffer = cmd;				// Send cmd
+  wiringPiSPIDataRW(0,&buffer,1);
+  if (buffer == 0xF1)
+  {
+    sprintf(buf,"%X", arg);
+    error_log("Argument:", buf);
+    buffer = arg;			// Send arg
+    wiringPiSPIDataRW(0,&buffer,1);
+  }
+  buffer = 0xFF;			// Send as NO-OP
+  wiringPiSPIDataRW(0,&buffer,1);
+  if (buffer == arg)
+    error_log("Success!","");
+  else
+  {
+    sprintf(buf,"%X", buffer);
+    error_log("Failure!", buf);
+  }
+}
+
+int trySPIcon(void)
+{
+  // Increase the number of times we have come here and break if more than 0
+  if (error_count++ > 0)
+    return 0;
+
+  // Buffer for passing error code (int) to function (char)
+  char buf[3];
+
+  if (digitalRead(INT_PIN) == 1)	// Check if we somehow missed the interrupt
+  {
+    error_log("Somehow we have missed the interrupt, execute NOW!","");
+    myInterrupt();
+    error_count = 0;
+    return 1;
+  }
+  else
+  {
+    // Load SPI transmission buffer with PING
+    buffer = 0xFF;
+
+    wiringPiSPIDataRW(0,&buffer,1);	// Send first command and recieve whatever is in the buffer
+    buffer = 0xFF;			// Load with 0xFF again to PING
+    wiringPiSPIDataRW(0,&buffer,1);	// Buffer should contain answer to previous send command
+
+    switch(buffer)
+    {
+      case 0x00:
+        error_log("AVR is out of I2C_SYNC with CTC!","");
+        return 1;
+
+      case 0x01:
+        error_log("No new sample available for the last 65 seconds","");
+        return 1;
+
+      default:
+        sprintf(buf,"%u",buffer);
+        error_log("Strange fault:",buf);
+        return 1;
+    }
+  }
 }
 
 void error_log(char *log_message, char *error_str)
@@ -179,6 +278,7 @@ void finish_with_error(MYSQL *conn)
   mysql_close(conn);
   free(datalog);
   free(sample_template);
+  close(readfd);
   exit(1);
 }
 
@@ -194,23 +294,20 @@ void myInterrupt(void)
   // Set watchdog flag to indicate we're handling this IRQ
   int_active = 1;
 
-  // Transmission buffer for SPI, preloaded with SAMPLE_DUMP command
-  unsigned char buffer = 0x04;
+  // Load SPI buffer with SAMPLE_DUMP command
+  buffer = 0xF0;
 
   wiringPiSPIDataRW(0,&buffer,1);	// Send first command and recieve whatever is in the buffer
   buffer = 0xFE;			// Load with 0xFE to command next reply to be how many blocks to expect, if any
   wiringPiSPIDataRW(0,&buffer,1);	// Buffer should contain answer to previous send command
 
   // Check if SAMPLE_DUMP command was acknowledged
-  if (buffer != 0x04)
+  if (buffer != 0xF0)
   {
-    if (buffer != 0x01)
-    {
-      // Buffer for passing error code (int) to function (char)
-      char buf[3];
-      sprintf(buf,"%u",buffer);
-      error_log("Sample collection returned error:", buf);
-    }
+    // Buffer for passing error code (int) to function (char)
+    char buf[3];
+    sprintf(buf,"%u",buffer);
+    error_log("Sample collection returned error:", buf);
     int_active = 0;
     return;
   }
@@ -225,7 +322,7 @@ void myInterrupt(void)
   conn_alive = 1;
 
   // Check how many blocks to expect from AVR
-  buffer = 0xFE;			// Send as NO-OP
+  buffer = 0xFF;			// Send as NO-OP / PING
   wiringPiSPIDataRW(0,&buffer,1);
   int sample_sent = buffer;
 
@@ -234,47 +331,65 @@ void myInterrupt(void)
     sample_sent |= 2;
 
   // Execute right amount of loops to receive correct number of blocks from AVR
-  if (sample_sent & 8)			// SETTINGS block (Area 1)
-  {
-    buffer = sample_template[0];
-    wiringPiSPIDataRW(0,&buffer,1);
-    for (x = 1 ; x < settings ; x++)
-    {
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
-      datalog[x-1] = buffer;
-    }
-    buffer = 0xFE;			// Send as NO-OP
-    wiringPiSPIDataRW(0,&buffer,1);
-    datalog[settings-1] = buffer;
-  }
-
   if (sample_sent & 1)			// SYSTIME block (Area 2)
   {
     buffer = sample_template[settings];
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == 0x01)
+    {
+      error_log("No sample available error!", "systime");
+      int_active = 0;
+      return;
+    }
     for (x = settings+1 ; x < systime; x++)
     {
       buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
-    buffer = 0xFE;			// Send as NO-OP
+    buffer = 0xFF;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
     datalog[systime-1] = buffer;
+  }
+
+  if (sample_sent & 8)			// SETTINGS block (Area 1)
+  {
+    buffer = sample_template[0];
+    wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == 0x01)
+    {
+      error_log("No sample available error!", "settings");
+      int_active = 0;
+      return;
+    }
+    for (x = 1 ; x < settings ; x++)
+    {
+      buffer = sample_template[x];
+      wiringPiSPIDataRW(0,&buffer,1);
+      datalog[x-1] = buffer;
+    }
+    buffer = 0xFF;			// Send as NO-OP
+    wiringPiSPIDataRW(0,&buffer,1);
+    datalog[settings-1] = buffer;
   }
 
   if (sample_sent & 16)			// ALARMS block (Area 5)
   {
     buffer = sample_template[current];
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == 0x01)
+    {
+      error_log("No sample available error!", "alarms");
+      int_active = 0;
+      return;
+    }
     for (x = current+1 ; x < alarms ; x++)
     {
       buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
-    buffer = 0xFE;			// Send as NO-OP
+    buffer = 0xFF;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
     datalog[alarms-1] = buffer;
   }
@@ -283,13 +398,19 @@ void myInterrupt(void)
   {
     buffer = sample_template[alarms];
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == 0x01)
+    {
+      error_log("No sample available error!", "last_24h");
+      int_active = 0;
+      return;
+    }
     for (x = alarms+1 ; x < last24h ; x++)
     {
       buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
-    buffer = 0xFE;			// Send as NO-OP
+    buffer = 0xFF;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
     datalog[last24h-1] = buffer;
   }
@@ -298,13 +419,19 @@ void myInterrupt(void)
   {
     buffer = sample_template[last24h];
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == 0x01)
+    {
+      error_log("No sample available error!", "status");
+      int_active = 0;
+      return;
+    }
     for (x = last24h+1 ; x < status ; x++)
     {
       buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
-    buffer = 0xFE;			// Send as NO-OP
+    buffer = 0xFF;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
     datalog[status-1] = buffer;
   }
@@ -313,13 +440,19 @@ void myInterrupt(void)
   {
     buffer = sample_template[systime];
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == 0x01)
+    {
+      error_log("No sample available error!", "historical");
+      int_active = 0;
+      return;
+    }
     for (x = systime+1 ; x < historical ; x++)
     {
       buffer =  sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
-    buffer = 0xFE;			// Send as NO-OP
+    buffer = 0xFF;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
     datalog[historical-1] = buffer;
   }
@@ -328,19 +461,47 @@ void myInterrupt(void)
   {
     buffer = sample_template[historical];
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == 0x01)
+    {
+      error_log("No sample available error!", "current");
+      int_active = 0;
+      return;
+    }
     for (x = historical+1 ; x < current ; x++)
     {
       buffer = sample_template[x];
       wiringPiSPIDataRW(0,&buffer,1);
       datalog[x-1] = buffer;
     }
-    buffer = 0xFE;			// Send as NO-OP
+    buffer = 0xFF;			// Send as NO-OP
     wiringPiSPIDataRW(0,&buffer,1);
     datalog[current-1] = buffer;
   }
 
   buffer = 0xAD;			// End sample sending
   wiringPiSPIDataRW(0,&buffer,1);
+
+  // The routine for checking if the named pipe has a command waiting
+  int res;
+  char str[6];
+
+  res = read(readfd, str, 6);
+  if(res == 6)
+  {
+    int cmd,arg;
+    char ch;
+    sscanf(str, "%2x%1c%2x", &cmd, &ch, &arg);
+    if (cmd >= 0xDC && cmd <= 0xDE)
+      send_command(cmd, arg);
+  }
+  else
+    if (res != 0)
+    {
+      char buf[3];
+      sprintf(buf,"%u",res);
+      error_log("Read failed:", buf);
+      error_log("Errno:", strerror(errno));
+    }
 
   // Write downloaded array to files with some formatting to fit better into SQL database
   FILE *fp;
