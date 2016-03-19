@@ -18,8 +18,9 @@
 #define SPEED 2000000				// SPI speed
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
-#define FIFO_NAME "ctc_cmd"			// The named pipe
-#define SAMPLE_TEMPLATE "sample_template.dat"	// The sample template file
+#define FIFO_NAME "./ctc_cmd"			// The named pipe
+#define CONF_NAME "./mysql.cnf"			// The configuration file for MySQL
+#define SAMPLE_TEMPLATE "./sample_template.dat"	// The sample template file
 
 // Watchdog flag to check if SPI connection is alive
 uint8_t conn_alive = 0;
@@ -677,12 +678,9 @@ void myInterrupt(void)
 
   // MySQL magic happens here...
   MYSQL *conn = mysql_init(NULL);
-  char *server = "localhost";
-  char *user = "xxx";
-  char *password = "xxx";
-  char *database = "ctclog";
-
-  if (!mysql_real_connect(conn, server, user, password, database, 0, NULL, CLIENT_MULTI_STATEMENTS))
+  mysql_options(conn, MYSQL_READ_DEFAULT_FILE, CONF_NAME);
+  
+  if (!mysql_real_connect(conn, NULL, NULL, NULL, NULL, 0, NULL, CLIENT_MULTI_STATEMENTS))
     finish_with_error(conn);
 
   if (mysql_query(conn, sql_string))
