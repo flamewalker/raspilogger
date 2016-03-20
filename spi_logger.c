@@ -79,7 +79,7 @@ int main(void)
   pinMode(RESET_PIN, OUTPUT);
   digitalWrite(RESET_PIN, HIGH);
   pinMode(INT_PIN, INPUT);
-  pullUpDnControl(INT_PIN, PUD_DOWN);
+  pullUpDnControl(INT_PIN, PUD_OFF);
 
   // Initialize SPI communication
   if (wiringPiSPISetup(0, SPEED) < 0)
