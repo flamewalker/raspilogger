@@ -46,6 +46,10 @@ unsigned char buffer = 0x00;
 // Handle for named pipe
 int readfd;
 
+// Time related vars
+time_t time_1, time_2, time_3;
+uint8_t diff_t;
+
 // Function declarations
 void send_command(int, int);
 
@@ -116,30 +120,28 @@ int main(void)
     exit(EXIT_FAILURE);
   }
 
-  // Start by sending command to set SMS = 1
-//  send_command(0xDE, 0x01);
-
   // Endless loop waiting for IRQ
   fprintf(stdout, "Waiting for interrupt. Press CTRL+C to stop\n");
 
-  while (conn_alive == 0)
-  {
-  }
-
+  // Initialize time vars
+  time_1 = time(NULL);
+  time_2 = time_1;
+  
   while (1)
   {
-    sleep(65);
+    time_3 = time(NULL);
+    diff_t = time_2 + 70 - time_3;		// Calculate when 70 seconds have passed since last interrupt
+    sleep(diff_t);
     if (conn_alive == 1)	// Check if the SPI communication has been active in the last 65 seconds
     {
       conn_alive = 0;
-//      debug_msg();
     }
     else
     {
       if (trySPIcon() == 0)
       {
 	debug_msg();
-        error_log("SPI connection has not been in use for last 130 seconds, reset AVR!","");
+        error_log("SPI connection has not been in use for last 140 seconds, reset AVR!","");
         digitalWrite(RESET_PIN, LOW);
         sleep(1);
         digitalWrite(RESET_PIN, HIGH);
@@ -254,7 +256,7 @@ int trySPIcon(void)
         return 1;
 
       case 0x01:
-        error_log("No new sample available for the last 65 seconds","");
+        error_log("No new sample available for the last 70 seconds","");
         return 1;
 
       default:
@@ -458,6 +460,10 @@ void myInterrupt(void)
   conn_alive = 1;
   error_count = 0;
 
+  // Set time vars
+  time_1 = time(NULL);
+  time_2 = time_1;
+  
   // Check if SAMPLE_DUMP command was acknowledged
   if (buffer != 0xF0)
   {
