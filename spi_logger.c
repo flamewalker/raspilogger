@@ -3,18 +3,20 @@
  * ver 0.8.6
  */
 
-#include <stdio.h>
-#include <errno.h>				// For translating errno to plain text
 #include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>				// For translating errno to plain text
+#include <unistd.h>				// Need this for sleep
 #include <stdint.h>				// Needs this for uint8_t
 #include <time.h>				// Need this for time in logs
-#include <string.h>
 #include <wiringPi.h>				// WiringPi GPIO library
 #include <wiringPiSPI.h>			// WiringPi SPI library
 #include <mysql/mysql.h>			// MySQL library
 #include <fcntl.h>				// Need this for named pipes
+#include <signal.h>				// Need this for catching SIGIO
 
-#define PROG_VER "ver 0.8.6" 			// Program version
+#define PROG_VER "ver 0.8.6-next"		// Program version
 #define SPEED 2000000				// SPI speed
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
@@ -48,9 +50,14 @@ int readfd;
 
 // Time related vars
 time_t time_1, time_2, time_3;
-uint8_t diff_t;
+uint8_t diff_t, diff_i, diff_s;
+
+// Debug var
+uint8_t dbg = 0;
 
 // Function declarations
+void fifo_reader(int);
+
 void send_command(int, int);
 
 void debug_msg(void);
@@ -93,13 +100,16 @@ int main(void)
   }
 
   // Initialize the FIFO for commands
-  if (access(FIFO_NAME, F_OK) == -1)		// Check if FIFO already exists
-    if (mkfifo(FIFO_NAME, 0777) != 0)		// If not, then create FIFO
+  if (access(FIFO_NAME, F_OK) == -1)			// Check if FIFO already exists
+    if (mkfifo(FIFO_NAME, 0777) != 0)			// If not, then create FIFO
     {
       error_log("Could not create fifo:", FIFO_NAME);
       exit(EXIT_FAILURE);
     }
   readfd = open(FIFO_NAME, O_RDONLY | O_NONBLOCK);	// Open FIFO in read-only, non-blocking mode
+  fcntl(readfd, F_SETOWN, getpid());			// Connect the FIFO to this programs PID
+  fcntl(readfd, F_SETFL, O_ASYNC);			// Set the O_ASYNC on the FIFO
+  signal(SIGIO, fifo_reader);				// Register our handler of SIGIO
 
   // Create initial space before checking template file and setting actual values
   datalog=(uint8_t*)malloc(sizeof(uint8_t));
@@ -123,33 +133,76 @@ int main(void)
   // Endless loop waiting for IRQ
   fprintf(stdout, "Waiting for interrupt. Press CTRL+C to stop\n");
 
+  // Var for error_log
+  char buf[3];
+
   // Initialize time vars
   time_1 = time(NULL);
   time_2 = time_1;
-  
+
   while (1)
   {
     time_3 = time(NULL);
     diff_t = time_2 + 70 - time_3;		// Calculate when 70 seconds have passed since last interrupt
-    sleep(diff_t);
-    if (conn_alive == 1)	// Check if the SPI communication has been active in the last 65 seconds
+
+    // Debug code
+    if (dbg)
     {
-      conn_alive = 0;
+      sprintf(buf, "%u )", diff_t);
+      error_log("Sleep (", buf);
     }
-    else
+
+    if ((sleep(diff_t)) == 0)
     {
-      if (trySPIcon() == 0)
-      {
-	debug_msg();
-        error_log("SPI connection has not been in use for last 140 seconds, reset AVR!","");
-        digitalWrite(RESET_PIN, LOW);
-        sleep(1);
-        digitalWrite(RESET_PIN, HIGH);
-        error_count = 0;
-      }
+      if (conn_alive == 1)			// Check if the SPI communication has been active in the last 65 seconds
+        conn_alive = 0;
+      else
+        if (trySPIcon() == 0)
+        {
+	  debug_msg();
+	  error_log("SPI connection has not been in use for last 140 seconds, reset AVR!","");
+	  digitalWrite(RESET_PIN, LOW);
+	  sleep(1);
+	  digitalWrite(RESET_PIN, HIGH);
+	  error_count = 0;
+        }
     }
   }
   exit(EXIT_FAILURE);
+}
+
+void fifo_reader(int signum)
+{
+  // The routine for checking if the named pipe has a command waiting
+  int res;
+  char str[6];
+
+  while((res=read(readfd, str, 6)) > 0)
+  {
+    if(res == 6)
+    {
+      int cmd,arg = 0;
+      sscanf(str, "%2x %2x", &cmd, &arg);
+      if (cmd >= 0xDC && cmd <= 0xDE)
+        send_command(cmd, arg);
+      else
+      {
+        dbg = !dbg;
+        char buf[3];
+        sprintf(buf, "%u", dbg);
+        error_log("DEBUG MODE:", buf);
+        if (dbg)
+          debug_msg();
+      }
+    }
+    else
+    {
+      char buf[3];
+      sprintf(buf,"%u",res);
+      error_log("Read failed:", buf);
+      error_log("Errno:", strerror(errno));
+    }
+  }
 }
 
 void send_command(int cmd, int arg)
@@ -168,6 +221,8 @@ void send_command(int cmd, int arg)
     buffer = arg;			// Send arg
     wiringPiSPIDataRW(0,&buffer,1);
   }
+  if (buffer == 0xFF)
+    error_log("Command already in queue! Aborting!","");
   buffer = 0xFF;			// Send as NO-OP
   wiringPiSPIDataRW(0,&buffer,1);
   if (buffer == arg)
@@ -178,6 +233,7 @@ void send_command(int cmd, int arg)
     error_log("Failure!", buf);
   }
 }
+
 void debug_msg(void)
 {
    char buf[3];
@@ -206,22 +262,30 @@ void debug_msg(void)
     wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
     sprintf(buf,"%u",buffer);
     error_log("Debug_msg, sample_pending=:",buf);
-    buffer = 0xF8;				// Load with F8 to request slask
+    buffer = 0xF8;				// Load with F8 to request slask_id
     wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
     sprintf(buf,"%u",buffer);
     error_log("Debug_msg, test2=:",buf);
     buffer = 0xF9;				// Load with F9 to request count
     wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
     sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, slask=:",buf);
-    buffer = 0xFA;				// Load with FA to command start_sample = true
+    error_log("Debug_msg, slask_id=:",buf);
+    buffer = 0xFB;				// Load with FB to request slask_re
     wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
     sprintf(buf,"%02X",buffer);
     error_log("Debug_msg, count=:",buf);
+    buffer = 0xFC;				// Load with FC to request state_dbg_wr
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, slask_re=:",buf);
+    buffer = 0xFD;				// Load with FD to request state_dbg_re
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+    sprintf(buf,"%02X",buffer);
+    error_log("Debug_msg, state_dbg_wr=:",buf);
     buffer = 0xFF;				// Load with FF to send PING
     wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
     sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, I2C_SAMPLE cmd sent:",buf);
+    error_log("Debug_msg, state_dbg_re=:",buf);
 }
 
 int trySPIcon(void)
@@ -229,7 +293,7 @@ int trySPIcon(void)
   // Buffer for passing error code (int) to function (char)
   char buf[3];
 
-  if (digitalRead(INT_PIN) == 1)	// Check if we somehow missed the interrupt
+  if (digitalRead(INT_PIN) == 1)		// Check if we somehow missed the interrupt
   {
     error_log("Somehow we have missed the interrupt, execute NOW!","");
     myInterrupt();
@@ -462,8 +526,20 @@ void myInterrupt(void)
 
   // Set time vars
   time_1 = time(NULL);
+  diff_i = time_1 - time_2;
+  diff_s = time_1 - time_3;
   time_2 = time_1;
-  
+
+  // Debug code
+  if (dbg)
+  {
+    char buf[3];
+    sprintf(buf, "%2u", diff_i);
+    error_log("ISR: Time since last =", buf);
+    sprintf(buf, "%2u", diff_s);
+    error_log("ISR: Time since sleep=", buf);
+  }
+
   // Check if SAMPLE_DUMP command was acknowledged
   if (buffer != 0xF0)
   {
@@ -514,9 +590,6 @@ void myInterrupt(void)
   buffer = 0xFF;			// Send as NO-OP / PING
   wiringPiSPIDataRW(0,&buffer,1);
 
-//    sprintf(buf,"%u",buffer);
-//    error_log("Reached sample_sent=:", buf);
-
   int sample_sent = buffer;
 
   // If SYSTIME has changed, make sure we get a CURRENT sample also
@@ -548,28 +621,6 @@ void myInterrupt(void)
 
   buffer = 0xAD;			// End sample sending
   wiringPiSPIDataRW(0,&buffer,1);
-
-  // The routine for checking if the named pipe has a command waiting
-  int res;
-  char str[6];
-
-  res = read(readfd, str, 6);
-  if(res == 6)
-  {
-    int cmd,arg;
-    char ch;
-    sscanf(str, "%2x%1c%2x", &cmd, &ch, &arg);
-    if (cmd >= 0xDC && cmd <= 0xDE)
-      send_command(cmd, arg);
-  }
-  else
-    if (res != 0)
-    {
-      char buf[3];
-      sprintf(buf,"%u",res);
-      error_log("Read failed:", buf);
-      error_log("Errno:", strerror(errno));
-    }
 
   // Write downloaded array to files with some formatting to fit better into SQL database
   FILE *fp;
@@ -685,7 +736,7 @@ void myInterrupt(void)
   // MySQL magic happens here...
   MYSQL *conn = mysql_init(NULL);
   mysql_options(conn, MYSQL_READ_DEFAULT_FILE, CONF_NAME);
-  
+
   if (!mysql_real_connect(conn, NULL, NULL, NULL, NULL, 0, NULL, CLIENT_MULTI_STATEMENTS))
     finish_with_error(conn);
 
