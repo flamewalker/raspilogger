@@ -101,7 +101,7 @@ int main(void)
 
   // Initialize the FIFO for commands
   if (access(FIFO_NAME, F_OK) == -1)			// Check if FIFO already exists
-    if (mkfifo(FIFO_NAME, 0777) != 0)			// If not, then create FIFO
+    if (mkfifo(FIFO_NAME, 0666) != 0)			// If not, then create FIFO
     {
       error_log("Could not create fifo:", FIFO_NAME);
       exit(EXIT_FAILURE);
