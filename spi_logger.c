@@ -101,7 +101,7 @@ int main(void)
 
   // Initialize the FIFO for commands
   if (access(FIFO_NAME, F_OK) == -1)			// Check if FIFO already exists
-    if (mkfifo(FIFO_NAME, 0666) != 0)			// If not, then create FIFO
+    if (mkfifo(FIFO_NAME, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IWOTH | S_IROTH) != 0)			// If not, then create FIFO
     {
       error_log("Could not create fifo:", FIFO_NAME);
       exit(EXIT_FAILURE);
@@ -168,6 +168,7 @@ int main(void)
         }
     }
   }
+  error_log("Unrecoverable ERROR!","");
   exit(EXIT_FAILURE);
 }
 
@@ -176,6 +177,8 @@ void fifo_reader(int signum)
   // The routine for checking if the named pipe has a command waiting
   int res;
   char str[6];
+
+  char buf[3];
 
   while((res=read(readfd, str, 6)) > 0)
   {
@@ -187,12 +190,30 @@ void fifo_reader(int signum)
         send_command(cmd, arg);
       else
       {
-        dbg = !dbg;
-        char buf[3];
-        sprintf(buf, "%u", dbg);
-        error_log("DEBUG MODE:", buf);
-        if (dbg)
-          debug_msg();
+        if (cmd >= 0xA0 && cmd <= 0xAD)
+        {
+          buffer = cmd;					// Load with cmd to request variable
+          wiringPiSPIDataRW(0,&buffer,1);		// Send first command and recieve whatever is in the buffer
+          sprintf(buf,"%02X",buffer);
+          error_log("Debug_msg, expect 0xAD:",buf);	// Should be 0xAD if previous sample was successfull
+          buffer = 0xFF;				// Load with 0xFF to send PING
+          wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+          sprintf(buf,"%u",buffer);
+          error_log("Debug_msg, cmd=:",buf);
+        }
+        else
+        {
+          if (cmd == 0xAF)
+            debug_msg();
+          else
+          {
+            dbg = !dbg;
+            sprintf(buf, "%u", dbg);
+            error_log("DEBUG MODE:", buf);
+            if (dbg)
+              debug_msg();
+          }
+        }
       }
     }
     else
@@ -236,56 +257,70 @@ void send_command(int cmd, int arg)
 
 void debug_msg(void)
 {
-   char buf[3];
-    // Load SPI transmission buffer
-    buffer = 0xF2;				// Load with F2 to request variable sample_send
-    wiringPiSPIDataRW(0,&buffer,1);		// Send first command and recieve whatever is in the buffer
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, expect 0xAD:",buf);	// Should be 0xAD if previous sample was successfull
-    buffer = 0xF3;				// Load with 0xF3 to request variable i2c_state
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%u",buffer);
-    error_log("Debug_msg, sample_done=:",buf);
-    buffer = 0xF4;				// Load with F4 to request i2c_nextcmd[0]
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%u",buffer);
-    error_log("Debug_msg, i2c_state=:",buf);
-    buffer = 0xF5;				// Load with F5 to request i2c_nextcmd[1]
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, i2c_nextcmd[0]=:",buf);
-    buffer = 0xF6;				// Load with F6 to request sample_pending
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, i2c_nextcmd[1]=:",buf);
-    buffer = 0xF7;				// Load with F7 to request test2
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%u",buffer);
-    error_log("Debug_msg, sample_pending=:",buf);
-    buffer = 0xF8;				// Load with F8 to request slask_id
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%u",buffer);
-    error_log("Debug_msg, test2=:",buf);
-    buffer = 0xF9;				// Load with F9 to request count
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, slask_id=:",buf);
-    buffer = 0xFB;				// Load with FB to request slask_re
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, count=:",buf);
-    buffer = 0xFC;				// Load with FC to request state_dbg_wr
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, slask_re=:",buf);
-    buffer = 0xFD;				// Load with FD to request state_dbg_re
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, state_dbg_wr=:",buf);
-    buffer = 0xFF;				// Load with FF to send PING
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    sprintf(buf,"%02X",buffer);
-    error_log("Debug_msg, state_dbg_re=:",buf);
+  char buf[3];
+  error_log("------------------------------------------","");
+  // Load SPI transmission buffer
+  buffer = 0xA0;				// Load with A0 to request i2c_state
+  wiringPiSPIDataRW(0,&buffer,1);		// Send first command and recieve whatever is in the buffer
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, expect 0xAD:",buf);	// Should be 0xAD if previous sample was successfull
+  buffer = 0xA1;				// Load with A1 to request i2c_nextcmd[0]
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, i2c_state=:",buf);
+  buffer = 0xA2;				// Load with A2 to request i2c_nextcmd[1]
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, i2c_nextcmd[0]=:",buf);
+  buffer = 0xA3;				// Load with A3 to request test2
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, i2c_nextcmd[1]=:",buf);
+  buffer = 0xA4;				// Load with A4 to request test3
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, test2=:",buf);
+  buffer = 0xA5;				// Load with A5 to request sample_done
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, test3=:",buf);
+  buffer = 0xA6;				// Load with A6 to request sample_pending
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, sample_done=:",buf);
+  buffer = 0xA7;				// Load with A7 to request stat_sampling
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, sample_pending=:",buf);
+  buffer = 0xA8;				// Load with A8 to request slask_id
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, start_sampling=:",buf);
+  buffer = 0xA9;				// Load with A9 to request slask_re1
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, slask_id=:",buf);
+  buffer = 0xAA;				// Load with AA to request slask_re2
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, slask_re1=:",buf);
+  buffer = 0xAB;				// Load with AB to request count
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, slask_re2=:",buf);
+  buffer = 0xAC;				// Load with AC to request state_dbg_wr
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, count=:",buf);
+  buffer = 0xAD;				// Load with AD to request state_dbg_re
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, state_dbg_wr=:",buf);
+  buffer = 0xFF;				// Load with FF to send PING
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%u",buffer);
+  error_log("Debug_msg, state_dbg_re=:",buf);
+  error_log("------------------------------------------","");
 }
 
 int trySPIcon(void)
@@ -412,7 +447,7 @@ void finish_with_error(MYSQL *conn)
   free(datalog);
   free(sample_template);
   close(readfd);
-  exit(1);
+  exit(EXIT_FAILURE);
 }
 
 uint8_t test_spi(uint8_t val)
@@ -580,8 +615,8 @@ void myInterrupt(void)
     }
   }
 
-  // String to use for building MySQL query
-  char sql_string[1000];
+  // String to use for building MySQL query, last time I checked it was 1044 chars... So remember to add if needed
+  char sql_string[1050];
 
   // Every C prog must have an x counter... and a y variable
   uint8_t x,y;
@@ -735,7 +770,8 @@ void myInterrupt(void)
 
   // MySQL magic happens here...
   MYSQL *conn = mysql_init(NULL);
-  mysql_options(conn, MYSQL_READ_DEFAULT_FILE, CONF_NAME);
+  if (mysql_options(conn, MYSQL_READ_DEFAULT_FILE, CONF_NAME) != 0)
+    finish_with_error(conn);
 
   if (!mysql_real_connect(conn, NULL, NULL, NULL, NULL, 0, NULL, CLIENT_MULTI_STATEMENTS))
     finish_with_error(conn);
