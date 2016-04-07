@@ -1,6 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
- * ver 0.8.6
+ * ver 0.8.7
  */
 
 #include <stdlib.h>
@@ -16,7 +16,7 @@
 #include <fcntl.h>				// Need this for named pipes
 #include <signal.h>				// Need this for catching SIGIO
 
-#define PROG_VER "ver 0.8.6-next"		// Program version
+#define PROG_VER "ver 0.8.7"		// Program version
 #define SPEED 2000000				// SPI speed
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
