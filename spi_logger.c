@@ -53,7 +53,7 @@ time_t time_1, time_2, time_3;
 uint8_t diff_t, diff_i, diff_s;
 
 // Debug var
-uint8_t dbg = 0;
+uint8_t dbg, duplicate_count = 0;
 
 // Function declarations
 void fifo_reader(int);
@@ -292,27 +292,31 @@ void debug_msg(void)
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%u",buffer);
   error_log("Debug_msg, sample_pending=:",buf);
-  buffer = 0xA8;				// Load with A8 to request slask_id
+  buffer = 0xA8;				// Load with A8 to request slask_id1
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%u",buffer);
   error_log("Debug_msg, start_sampling=:",buf);
-  buffer = 0xA9;				// Load with A9 to request slask_re1
+  buffer = 0xA9;				// Load with A9 to request slask_id2
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%02X",buffer);
-  error_log("Debug_msg, slask_id=:",buf);
-  buffer = 0xAA;				// Load with AA to request slask_re2
+  error_log("Debug_msg, slask_id1=:",buf);
+  buffer = 0xAA;				// Load with AA to request slask_re1
+  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
+  sprintf(buf,"%02X",buffer);
+  error_log("Debug_msg, slask_id2=:",buf);
+  buffer = 0xAB;				// Load with AB to request slask_re2
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%02X",buffer);
   error_log("Debug_msg, slask_re1=:",buf);
-  buffer = 0xAB;				// Load with AB to request count
+  buffer = 0xAC;				// Load with AC to request count
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%02X",buffer);
   error_log("Debug_msg, slask_re2=:",buf);
-  buffer = 0xAC;				// Load with AC to request state_dbg_wr
+  buffer = 0xAD;				// Load with AD to request state_dbg_wr
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%02X",buffer);
   error_log("Debug_msg, count=:",buf);
-  buffer = 0xAD;				// Load with AD to request state_dbg_re
+  buffer = 0xAE;				// Load with AE to request state_dbg_re
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%u",buffer);
   error_log("Debug_msg, state_dbg_wr=:",buf);
@@ -320,6 +324,8 @@ void debug_msg(void)
   wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
   sprintf(buf,"%u",buffer);
   error_log("Debug_msg, state_dbg_re=:",buf);
+  sprintf(buf,"%u",duplicate_count);
+  error_log("Debug_msg, duplicate_count=:",buf);
   error_log("------------------------------------------","");
 }
 
@@ -337,6 +343,9 @@ int trySPIcon(void)
   }
   else
   {
+    // Set a new time for the next waiting period
+    time_2 = time(NULL);
+
     // Increase the number of times we have come here and break if more than 0
     if (error_count++ > 0)
       return 0;
@@ -482,12 +491,22 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
 
   for (x = start+1 ; x < stop ; x++)
   {
-    buffer =  sample_template[x];
+    buffer = sample_template[x];
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == sample_template[x-1])		// Check if we got back a copy of what we sent
+    {
+      wiringPiSPIDataRW(0,&buffer,1);
+      duplicate_count++;
+    }
     datalog[x-1] = buffer;
   }
   buffer = 0xFF;			// Send as NO-OP
   wiringPiSPIDataRW(0,&buffer,1);
+  if (buffer == sample_template[x-1])		// Check if we got back a copy of what we sent
+  {
+    wiringPiSPIDataRW(0,&buffer,1);
+    duplicate_count++;
+  }
   datalog[stop-1] = buffer;
   return 1;
 }
@@ -514,10 +533,20 @@ uint8_t get_onewire(uint8_t start, uint8_t stop)
   {
     buffer = 0xB0 + x;
     wiringPiSPIDataRW(0,&buffer,1);
+    if (buffer == (0xB0 + x - 1))		// Check if we got back a copy of what we sent
+    {
+      wiringPiSPIDataRW(0,&buffer,1);
+      duplicate_count++;
+    }
     temperaturearray[x-1] = buffer;
   }
   buffer = 0xFF;
   wiringPiSPIDataRW(0,&buffer,1);
+  if (buffer == (0xB0 + x - 1))			// Check if we got back a copy of what we sent
+  {
+    wiringPiSPIDataRW(0,&buffer,1);
+    duplicate_count++;
+  }
   temperaturearray[stop-1] = buffer;
   return 1;
 }
