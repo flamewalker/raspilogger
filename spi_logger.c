@@ -142,7 +142,7 @@ int main(void)
 
     // Debug code
     if (dbg)
-      fprintf(stderr, "Sleep ( %u )", diff_t);
+      fprintf(stderr, "Debug msg, Sleep ( %u )\n", diff_t);
 
     if ((sleep(diff_t)) == 0)
     {
@@ -223,23 +223,23 @@ void fifo_reader(int signum)
 
 void send_command(int cmd, int arg)
 {
-  fprintf(stderr, "Command: %02X\n", cmd);
+  fprintf(stderr, "SEND_COMMAND: Command: %02X\n", cmd);
   buffer = 0xF1;			// Start COMMAND sequence
   wiringPiSPIDataRW(0,&buffer,1);
   buffer = cmd;				// Send cmd
   wiringPiSPIDataRW(0,&buffer,1);
   if (buffer == 0xF1)
   {
-    fprintf(stderr, "Argument: %02X\n", arg);
+    fprintf(stderr, "SEND_COMMAND: Argument: %02X\n", arg);
     buffer = arg;			// Send arg
     wiringPiSPIDataRW(0,&buffer,1);
   }
   if (buffer == 0xFF)
-    fprintf(stderr, "Command already in queue! Aborting!\n");
+    fprintf(stderr, "SEND_COMMAND: Command already in queue! Aborting!\n");
   buffer = 0xFF;			// Send as NO-OP
   wiringPiSPIDataRW(0,&buffer,1);
   if (buffer == arg)
-    fprintf(stderr, "Success!\n");
+    fprintf(stderr, "SEND_COMMAND: Success!\n");
   else
     fprintf(stderr, "SEND_COMMAND: Failure! %02X\n", buffer);
 }
@@ -324,15 +324,15 @@ int trySPIcon(void)
     switch(buffer)
     {
       case 0x00:
-        fprintf(stderr, "AVR is out of I2C_SYNC with CTC!\n");
+        fprintf(stderr, "TrySPI: AVR is out of I2C_SYNC with CTC!\n");
         return 1;
 
       case 0x01:
-        fprintf(stderr, "No new sample available for the last 70 seconds\n");
+        fprintf(stderr, "TrySPI: No new sample available for the last 70 seconds\n");
         return 1;
 
       default:
-        fprintf(stderr, "Strange fault: %u\n", buffer);
+        fprintf(stderr, "TrySPI: Strange fault: %u\n", buffer);
         return 1;
     }
   }
