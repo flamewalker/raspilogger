@@ -1,6 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
- * ver 0.8.7
+ * ver 0.8.8
  */
 
 #include <stdlib.h>
@@ -16,7 +16,7 @@
 #include <fcntl.h>				// Need this for named pipes
 #include <signal.h>				// Need this for catching SIGIO
 
-#define PROG_VER "ver 0.8.7-next"		// Program version
+#define PROG_VER "ver 0.8.8"			// Program version
 #define SPEED 2000000				// SPI speed in Hz. AVR in slave mode is only guaranteed to fosc/4 or lower, ie. 4 Mhz
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
