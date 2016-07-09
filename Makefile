@@ -1,2 +1,3 @@
 all:
-	gcc spi_logger.c -o spi_logger -I/usr/include/mysql -DBIG_JOINS=1  -fno-strict-aliasing   -g -L/usr/lib/arm-linux-gnueabihf -lmysqlclient -lpthread -lz -lm -lrt -ldl -lwiringPi
+	gcc -c 'mysql_config --cflags' spi_logger.c
+	gcc -o spi_logger spi_logger.o 'mysql_config --libs' -lwiringPi
