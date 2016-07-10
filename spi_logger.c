@@ -16,7 +16,7 @@
 #include <fcntl.h>				// Need this for named pipes
 #include <signal.h>				// Need this for catching SIGIO
 
-#define PROG_VER "ver 0.8.8"			// Program version
+#define PROG_VER "ver 0.8.8-next"		// Program version
 #define SPEED 2000000				// SPI speed in Hz. AVR in slave mode is only guaranteed to fosc/4 or lower, ie. 4 Mhz
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
@@ -36,11 +36,8 @@ uint8_t int_active = 0;
 // Pointers to arrays for storing sample_template and sampled values
 uint8_t *datalog, *sample_template;
 
-// OneWire temperature array
-uint8_t temperaturearray[20];
-
 // Variables for keeping track of areas of sampling
-uint8_t array_size,settings,historical,systime,current,alarms,last24h,status;
+uint8_t array_size,settings,historical,systime,current,alarms,last24h,status,temperature;
 
 // Transmission buffer for SPI (usable all over the place...)
 unsigned char buffer = 0x00;
@@ -71,8 +68,6 @@ void init_arrays(void);
 int find_reg(uint8_t);
 
 uint8_t get_sample(uint8_t, uint8_t);
-
-uint8_t get_onewire(uint8_t, uint8_t);
 
 void myInterrupt(void);
 
@@ -170,8 +165,6 @@ void fifo_reader(int signum)
   int res;
   char str[6];
 
-  char buf[3];
-
   while((res=read(readfd, str, 6)) > 0)
   {
     if(res == 6)
@@ -246,7 +239,6 @@ void send_command(int cmd, int arg)
 
 void debug_msg(void)
 {
-  char buf[3];
   fprintf(stderr, "------------------------------------------\n");
   // Load SPI transmission buffer
   buffer = 0xA0;				// Load with A0 to request test1
@@ -295,9 +287,6 @@ void debug_msg(void)
 
 int trySPIcon(void)
 {
-  // Buffer for passing error code (int) to function (char)
-  char buf[3];
-
   if (digitalRead(INT_PIN) == 1)		// Check if we somehow missed the interrupt
   {
     fprintf(stderr, "TrySPI: Somehow we have missed the interrupt, execute NOW!\n");
@@ -318,7 +307,7 @@ int trySPIcon(void)
 
     // Check SPI transmission
     buffer = 0xF2;				// Load with F2 to request TWI RESET
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command, probably 0xAD if previos sample was OK
+    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command, probably 0xAD if previous sample was OK
     buffer = 0xFF;				// Load with FF to send PING
     wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
     switch(buffer)
@@ -347,7 +336,7 @@ void init_arrays(void)
   char ch;
 
   // First read the size of the sample_template array
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   array_size = data;
 
   // Make more room for arrays
@@ -355,35 +344,39 @@ void init_arrays(void)
   sample_template=(uint8_t*)realloc(sample_template,sizeof(uint8_t)*array_size);
 
   // Read size of area1
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   settings = data;
 
   // Read size of area2
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   systime = settings+data;
 
   // Read size of area3
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   historical = systime+data;
 
   // Read size of area4
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   current = historical+data;
 
   // Read size of area5
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   alarms = current+data;
 
   // Read size of area6
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   last24h = alarms+data;
 
   // Read size of area7
-  fscanf(sp,"%x%c", &data, &ch);
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
   status = last24h+data;
 
+  // Read size of area8
+  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
+  temperature = status+data;
+
   // Store sample_template in array
-  while(EOF!=(inc=fscanf(sp,"%x%c", &data, &ch)) && inc == 2)
+  while(EOF != (inc = fscanf(sp,"%x%c", &data, &ch)) && inc == 2)	// Read HEX values until EOF
     sample_template[count++] = data;
 
   fclose(sp);
@@ -461,7 +454,7 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
   {
     fprintf(stderr, "Get_sample: Duplicate answer from register: %02X\n", buffer);
     buffer = sample_template[stop-1];
-    usleep(1);				// Short delay to allow AVR to catch up
+    usleep(1);					// Short delay to allow AVR to catch up
     wiringPiSPIDataRW(0,&buffer,1);
     buffer = 0xFF;
     wiringPiSPIDataRW(0,&buffer,1);
@@ -471,49 +464,8 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
   return 1;
 }
 
-uint8_t get_onewire(uint8_t start, uint8_t stop)
-{
-  buffer = (0xB0 + start);
-  wiringPiSPIDataRW(0,&buffer,1);
-  // Every C prog must have an x counter
-  uint8_t x;
-
-  for (x = start+1 ; x < stop ; x++)
-  {
-    buffer = (0xB0 + x);
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (buffer == (0xB0 + x - 1))		// Check if we got back a copy of what we sent
-    {
-      fprintf(stderr, "Get_onewire: Duplicate answer from register: %02X\n", buffer);
-      buffer = (0xB0 + x - 1);
-      usleep(1);				// Short delay to allow AVR to catch up
-      wiringPiSPIDataRW(0,&buffer,1);
-      buffer = (0xB0 + x);
-      wiringPiSPIDataRW(0,&buffer,1);
-      duplicate_count++;
-    }
-    temperaturearray[x-1] = buffer;
-  }
-  buffer = 0xFF;
-  wiringPiSPIDataRW(0,&buffer,1);
-  if (buffer == (0xB0 + stop - 1))		// Check if we got back a copy of what we sent
-  {
-    fprintf(stderr, "Get_onewire: Duplicate answer from register: %02X\n", buffer);
-    buffer = (0xB0 + stop - 1);
-    usleep(1);				// Short delay to allow AVR to catch up
-    wiringPiSPIDataRW(0,&buffer,1);
-    buffer = 0xFF;
-    wiringPiSPIDataRW(0,&buffer,1);
-    duplicate_count++;
-  }
-  temperaturearray[stop-1] = buffer;
-  return 1;
-}
-
 void myInterrupt(void)
 {
-  char buf[3];
-
   // Check if we somehow have called this procedure already...
   if (int_active == 1)
   {
@@ -599,14 +551,14 @@ void myInterrupt(void)
 
   // If SYSTIME has changed, make sure we get a CURRENT sample also
   if (sample_sent & 1)
-    sample_sent |= 2;
+    sample_sent |= 130;
 
   // Execute right amount of loops to receive correct number of blocks from AVR
   if (sample_sent & 1)			// SYSTIME block (Area 2)
     if(!get_sample(settings, systime))
       return;
   if (sample_sent & 2)			// CURRENT block (Area 4)
-    if(!get_sample(historical, current) || !get_onewire(0, 2))
+    if(!get_sample(historical, current))
       return;
   if (sample_sent & 4)			// HISTORICAL block (Area 3)
     if(!get_sample(systime, historical))
@@ -623,8 +575,11 @@ void myInterrupt(void)
   if (sample_sent & 64)			// STATUS block (Area 7)
     if(!get_sample(last24h, status))
       return;
+  if (sample_sent & 128)		// ONEWIRE block (Area 8)
+    if(!get_sample(status, temperature))
+      return;
 
-  buffer = 0xAD;			// End sample sending
+  buffer = 0xF0;			// Signal end of sample sending
   wiringPiSPIDataRW(0,&buffer,1);
 
   // Debug code
@@ -739,10 +694,15 @@ void myInterrupt(void)
     fprintf(fp, "%u", datalog[x]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/current.csv' INTO TABLE CURRENT FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+  }
 
+  // ONEWIRE table
+  if (sample_sent & 128)
+  {
     fp = fopen("/tmp/onewire.csv", "w");
     fprintf(fp,"NULL,");
-    fprintf(fp, "%u.%02u", temperaturearray[0], temperaturearray[1]);
+    for (x=status ; x < temperature-1 ; x=x+2)
+      fprintf(fp, "%u.%02u", datalog[x], datalog[x+1]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/onewire.csv' INTO TABLE ONEWIRE FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
   }
