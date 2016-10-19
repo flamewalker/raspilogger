@@ -4,25 +4,36 @@
  */
 
 #include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>				// For translating errno to plain text
+#include <stdio.h>				// File I/O and such
+#include <string.h>				// String handling functions
 #include <unistd.h>				// Need this for sleep
 #include <stdint.h>				// Needs this for uint8_t
 #include <time.h>				// Need this for time in logs
-#include <wiringPi.h>				// WiringPi GPIO library
-#include <wiringPiSPI.h>			// WiringPi SPI library
-#include <mysql/mysql.h>			// MySQL library
 #include <fcntl.h>				// Need this for named pipes
 #include <signal.h>				// Need this for catching SIGIO
+#include <wiringPi.h>				// WiringPi GPIO library
+#include <mysql/mysql.h>			// MySQL library
+
+#include <sys/ioctl.h>				// For SPI comms
+#include <linux/types.h>			// For SPI comms
+#include <linux/spi/spidev.h>			// Spidev functions
 
 #define PROG_VER "ver 0.8.8-next"		// Program version
-#define SPEED 2000000				// SPI speed in Hz. AVR in slave mode is only guaranteed to fosc/4 or lower, ie. 4 Mhz
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
+#define DHW_PIN 22				// BCM pin for signal DHW active
 #define FIFO_NAME "./ctc_cmd"			// The named pipe
 #define CONF_NAME "./mysql.cnf"			// The configuration file for MySQL
 #define SAMPLE_TEMPLATE "./sample_template.dat"	// The sample template file
+
+// SPIDEV variables
+static const char *device = "/dev/spidev1.0";
+static uint8_t mode = 0;
+static uint32_t speed = 3000000;		// SPI speed in Hz. AVR in slave mode is only guaranteed to fosc/4 or lower, ie. 4MHz
+static uint8_t bits = 8;
+static uint8_t tx_buffer = 0x00;
+static uint8_t rx_buffer = 0x00;
+static int spihandle;
 
 // Watchdog flag to check if SPI connection is alive
 uint8_t conn_alive = 0;
@@ -34,30 +45,38 @@ uint8_t error_count = 0;
 uint8_t int_active = 0;
 
 // Pointers to arrays for storing sample_template and sampled values
-uint8_t *datalog, *sample_template;
+uint8_t *datalog, *sample_template = NULL;
 
 // Variables for keeping track of areas of sampling
-uint8_t array_size,settings,historical,systime,current,alarms,last24h,status,temperature;
-
-// Transmission buffer for SPI (usable all over the place...)
-unsigned char buffer = 0x00;
+uint8_t array_size, settings, historical, systime, current, alarms, last24h, status, temperature = 0;
 
 // Handle for named pipe
 int readfd;
 
 // Time related vars
-time_t time_1, time_2, time_3;
+time_t time_1, time_2, time_3, dhw_start;
 uint8_t diff_t, diff_i, diff_s;
+clock_t tick_1, tick_2, tick_3;
+
+// DHW active flag
+uint8_t dhw = 0;
 
 // Debug var
-uint8_t dbg, duplicate_count, test4 = 0;
-float err_ratio = 0;
-float secs = 0;
+uint8_t dbg = 0;
+uint8_t duplicate_count, test4 = 0;
+float err_ratio = 0.0;
+float secs = 0.0;
 
 // Function declarations
+int spiTxRx(int fd, uint8_t *txDat, uint8_t *rxDat);
+
 void fifo_reader(int);
 
-void send_command(int, int);
+void send_command(uint8_t, uint8_t);
+
+void send_digi_command(uint8_t, uint8_t);
+
+void set_temp(uint8_t);
 
 void debug_msg(void);
 
@@ -76,27 +95,31 @@ void finish_with_error(MYSQL *conn);
 // Main program
 int main(void)
 {
+  // Necessary to remove buffering on stdout to have anything written to journal
+  setvbuf(stdout, NULL, _IONBF, 0);
+
   // Greeting message to signal we're alive
-  fprintf(stdout, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
+  fprintf(stderr, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
   fprintf(stderr, "Initialize error log. SPI_LOGGER %s\n",PROG_VER);
 
   // Initialize GPIO
   wiringPiSetupGpio();
   pinMode(RESET_PIN, OUTPUT);
   digitalWrite(RESET_PIN, HIGH);
-  pinMode(INT_PIN, INPUT);
-  pullUpDnControl(INT_PIN, PUD_OFF);
+  pinMode(DHW_PIN, OUTPUT);
+  digitalWrite(DHW_PIN, LOW);
+ // pinMode(INT_PIN, INPUT);
+ // pullUpDnControl(INT_PIN, PUD_OFF);
 
   // Initialize SPI communication
-  if (wiringPiSPISetup(0, SPEED) < 0)
-  {
-    fprintf(stderr, "Unable to open SPI device 0: %s\n", strerror(errno));
-    exit(EXIT_FAILURE);
-  }
+  spihandle = open(device, O_RDWR);
+  ioctl (spihandle, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
+  ioctl (spihandle, SPI_IOC_WR_BITS_PER_WORD, &bits);
+  ioctl (spihandle, SPI_IOC_WR_MODE, &mode);
 
   // Initialize the FIFO for commands
-  if (access(FIFO_NAME, F_OK) == -1)			// Check if FIFO already exists
-    if (mkfifo(FIFO_NAME, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IWOTH | S_IROTH) != 0)			// If not, then create FIFO
+  if (access(FIFO_NAME, F_OK) == -1)								// Check if FIFO already exists
+    if (mkfifo(FIFO_NAME, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IWOTH | S_IROTH) != 0)	// If not, then create FIFO
     {
       fprintf(stderr, "Could not create fifo: %s\n", FIFO_NAME);
       exit(EXIT_FAILURE);
@@ -106,24 +129,29 @@ int main(void)
   fcntl(readfd, F_SETFL, O_ASYNC);			// Set the O_ASYNC on the FIFO
   signal(SIGIO, fifo_reader);				// Register our handler of SIGIO
 
-  // Create initial space before checking template file and setting actual values
-  datalog=(uint8_t*)malloc(sizeof(uint8_t));
-  sample_template=(uint8_t*)malloc(sizeof(uint8_t));
-
   init_arrays();
 
   // Check if a sample is available before initializing interrupt and wait loop
   if (digitalRead(INT_PIN) == 1)
+  {
+    fprintf(stderr, "MAIN: INT_PIN active during setup, calling ISR\n");
     myInterrupt();
+  }
 
   // Initialize interrupt handling procedure
   if (wiringPiISR(INT_PIN, INT_EDGE_RISING, &myInterrupt) < 0)
   {
-    fprintf(stderr, "Unable to register ISR: %s\n", strerror(errno));
+    perror("Unable to register ISR");
     free(datalog);
+    datalog = NULL;
     free(sample_template);
+    sample_template = NULL;
+    close(readfd);
+    close(spihandle);
     exit(EXIT_FAILURE);
   }
+  // Init the tick counter
+  tick_1 = clock();
 
   // Initialize time vars
   time_1 = time(NULL);
@@ -138,148 +166,252 @@ int main(void)
     // Debug code
     if (dbg)
       fprintf(stderr, "Debug msg, Sleep ( %u )\n", diff_t);
-
+  
+    // DHW code
+	if (dhw)
+	  if ((time_3 - dhw_start) > 180)	// If 180 seconds have passed since we started DHW production
+	  {
+		digitalWrite(DHW_PIN, LOW);
+		dhw = 0;
+	    set_temp(60);
+		fprintf(stderr, "DHW stop\n");
+	  }
+	
     if ((sleep(diff_t)) == 0)
     {
-      if (conn_alive == 1)			// Check if the SPI communication has been active in the last 65 seconds
+      if (conn_alive == 1)				// Check if the SPI communication has been active in the last 70 seconds
         conn_alive = 0;
       else
         if (trySPIcon() == 0)
         {
-	  debug_msg();
-	  fprintf(stderr, "SPI connection has not been in use for last 140 seconds, reset AVR!\n");
-	  digitalWrite(RESET_PIN, LOW);
-	  sleep(1);
-	  digitalWrite(RESET_PIN, HIGH);
-	  error_count = 0;
+	      debug_msg();
+	      fprintf(stderr, "SPI connection has not been in use for last 140 seconds, reset AVR!\n");
+	      digitalWrite(RESET_PIN, LOW);
+	      sleep(1);
+	      digitalWrite(RESET_PIN, HIGH);
+	      error_count = 0;
         }
     }
   }
+  close(readfd);
+  close(spihandle);
+  free(datalog);
+  datalog = NULL;
+  free(sample_template);
+  sample_template = NULL;
   fprintf(stderr, "Unrecoverable ERROR!\n");
   exit(EXIT_FAILURE);
+}
+
+int spiTxRx(int fd, uint8_t *txDat, uint8_t *rxDat)
+{
+  int ret;
+  struct spi_ioc_transfer spi =
+  {
+    .tx_buf = (unsigned long)txDat,
+    .rx_buf = (unsigned long)rxDat,
+    .len = 1,
+    .delay_usecs = 0,
+    .speed_hz = speed,
+    .bits_per_word = 8
+  };
+  ret = ioctl(fd, SPI_IOC_MESSAGE(1), &spi);
+  if (ret < 1)
+  {
+    fprintf(stderr, "spiTxRx: Cant send message\n");
+    return -1;
+  }
+  return 0;
 }
 
 void fifo_reader(int signum)
 {
   // The routine for checking if the named pipe has a command waiting
-  int res;
-  char str[6];
+  int res, cmd, arg, data = 0;
+  char str[11];
 
-  while((res=read(readfd, str, 6)) > 0)
+  while((res = read(readfd, str, 11)) > 0)
   {
-    if(res == 6)
-    {
-      int cmd,arg = 0;
-      sscanf(str, "%2x %2x", &cmd, &arg);
-      if (cmd >= 0xDC && cmd <= 0xDE)
-        send_command(cmd, arg);
-      else
-      {
-        if (cmd >= 0xA0 && cmd <= 0xAF)
+	switch(res)
+	{
+	  case 3:		// command only (HEX)
+        sscanf(str, "%x", &cmd);
+		switch(cmd)
         {
-          buffer = cmd;					// Load with cmd to request variable
-          wiringPiSPIDataRW(0,&buffer,1);		// Send first command and recieve whatever is in the buffer
-          fprintf(stderr, "Debug_msg, expect 0xAD: %02X\n",buffer);	// Should be 0xAD if previous sample was successfull
-          buffer = 0xFF;				// Load with 0xFF to send PING
-          wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-          fprintf(stderr, "Debug_msg, cmd result=: %u\n",buffer);
+          case 0xB0:
+            debug_msg();
+            break;
+
+          case 0xB1:
+            fprintf(stderr, "Debug_msg, err_ratio=: %.2f\n", err_ratio);
+            fprintf(stderr, "Debug_msg, secs=: %.2f\n", secs);
+            break;
+			
+		  case 0xB2:
+		  	dbg = !dbg;
+            fprintf(stderr, "DEBUG MODE: %u\n", dbg);
+            if (dbg)
+              debug_msg();
+		    break;
+			
+		  case 0xB3:
+		  	digitalWrite(DHW_PIN, HIGH);
+		  	fprintf(stderr, "DHW start\n");
+			dhw = 1;
+			set_temp(30);
+			dhw_start = time(NULL);
+			break;
+	  
+          default:
+		    if (cmd >= 0xA0 && cmd <= 0xAF)
+            {
+              tx_buffer = cmd;												// Load with cmd to request variable
+              spiTxRx(spihandle, &tx_buffer, &rx_buffer);						// Send first command and receive whatever is in the buffer
+              fprintf(stderr, "Debug_msg, expect 0xAD: %02X\n", rx_buffer);	// Should be 0xAD if previous sample was successful
+              tx_buffer = 0xFF;												// Load with 0xFF to send PING
+              spiTxRx(spihandle, &tx_buffer, &rx_buffer);						// Buffer should contain answer to previous send command
+              fprintf(stderr, "Debug_msg, cmd result=: %u\n", rx_buffer);
+            }
+			else
+            {
+		      fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
+			  fprintf(stderr, "FIFO_READ: Cmd: %x\n", cmd);
+			}
         }
+	    break;
+		
+	  case 6:		// command and argument (HEX HEX/UINT)
+        sscanf(str, "%x%x", &cmd, &arg);
+        if (cmd >= 0xDC && cmd <= 0xDE)
+          send_command(cmd, arg);
         else
         {
-          switch(cmd)
+          if (cmd == 0xF2)
           {
-            case 0xB0:
-              debug_msg();
-              break;
-
-            case 0xB1:
-              fprintf(stderr, "Debug_msg, err_ratio=: %.2f\n",err_ratio);
-              fprintf(stderr, "Debug_msg, secs=: %.2f\n",secs);
-              break;
-
-            default:
-              dbg = !dbg;
-              fprintf(stderr, "DEBUG MODE: %u\n", dbg);
-              if (dbg)
-                debug_msg();
+            sscanf(str, "%x%u", &cmd, &arg);
+            set_temp(arg);
           }
+		  else
+		  {
+		    fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
+			fprintf(stderr, "FIFO_READ: Cmd: %x\tArg: %u\n", cmd, arg);
+		  }
         }
-      }
-    }
-    else
-    {
-      fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
-      fprintf(stderr, "FIFO_READ: Errno: %s\n", strerror(errno));
+		break;
+		
+      default:		// possibly command, argument and data (HEX UINT UINT)
+        sscanf(str, "%x%u%u", &cmd, &arg, &data);
+        if (cmd == 0xF3)
+          send_digi_command(arg, data);
+        else
+        {
+          fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
+          fprintf(stderr, "FIFO_READ: Cmd: %x\tArg: %u\tData: %u\n", cmd, arg, data);
+          perror("FIFO_READ");
+        }
     }
   }
 }
 
-void send_command(int cmd, int arg)
+void send_command(uint8_t cmd, uint8_t arg)
 {
   fprintf(stderr, "SEND_COMMAND: Command: %02X\n", cmd);
-  buffer = 0xF1;			// Start COMMAND sequence
-  wiringPiSPIDataRW(0,&buffer,1);
-  buffer = cmd;				// Send cmd
-  wiringPiSPIDataRW(0,&buffer,1);
-  if (buffer == 0xF1)
+  tx_buffer = 0xF1;								// Start COMMAND sequence
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  tx_buffer = cmd;								// Send cmd
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  if (rx_buffer == 0xF1)
   {
     fprintf(stderr, "SEND_COMMAND: Argument: %02X\n", arg);
-    buffer = arg;			// Send arg
-    wiringPiSPIDataRW(0,&buffer,1);
+    tx_buffer = arg;							// Send arg
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
   }
-  if (buffer == 0xFF)
+  if (rx_buffer == 0xFF)
     fprintf(stderr, "SEND_COMMAND: Command already in queue! Aborting!\n");
-  buffer = 0xFF;			// Send as NO-OP
-  wiringPiSPIDataRW(0,&buffer,1);
-  if (buffer == arg)
-    fprintf(stderr, "SEND_COMMAND: Success!\n");
+  tx_buffer = 0xFF;								// Send as NO-OP
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  if (rx_buffer == arg)
+    fprintf(stdout, "SEND_COMMAND: Success!\n");
   else
-    fprintf(stderr, "SEND_COMMAND: Failure! %02X\n", buffer);
+    fprintf(stderr, "SEND_COMMAND: Failure! %02X\n", rx_buffer);
+}
+
+void send_digi_command(uint8_t cmd, uint8_t data)
+{
+  fprintf(stdout, "SEND_DIGI_COMMAND: Cmd+Adr: %u\n", cmd);
+  tx_buffer = 0xF3;								// Start COMMAND sequence
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  tx_buffer = cmd;								// Send cmd+adr
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  if (rx_buffer == 0xF3)
+  {
+    fprintf(stdout, "SEND_DIGI_COMMAND: Data: %u\n", data);
+    tx_buffer = data;							// Send data
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  }
+  tx_buffer = 0xFF;								// Send as NO-OP to receive answer from Digipot
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  fprintf(stdout, "SEND_DIGI_COMMAND: Answer: %u\n", rx_buffer);
+}
+
+void set_temp(uint8_t temp)
+{
+  fprintf(stdout, "SET_TEMP: Temp: %u\n", temp);
+  tx_buffer = 0xF2;								// Start SET_TEMP sequence
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  tx_buffer = temp;								// Send temp
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  if (rx_buffer == 0xF2)
+  {
+    tx_buffer = 0xFF;							// Send as NO-OP to receive answer from AVR
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+    fprintf(stdout, "SET_TEMP: CTC Hot water: %u\n", rx_buffer);
+  }
 }
 
 void debug_msg(void)
 {
   fprintf(stderr, "------------------------------------------\n");
   // Load SPI transmission buffer
-  buffer = 0xA0;				// Load with A0 to request test1
-  wiringPiSPIDataRW(0,&buffer,1);		// Send first command and recieve whatever is in the buffer
-  fprintf(stderr, "Debug_msg, expect 0xAD: %02X\n",buffer);	// Should be 0xAD if previous sample was successfull
-  buffer = 0xA1;				// Load with A1 to request test2
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, test1=: %u\n",buffer);
-  buffer = 0xA2;				// Load with A2 to request test3
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, test2=: %u\n",buffer);
-  buffer = 0xA3;				// Load with A3 to request count
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, test3=: %u\n",buffer);
-  buffer = 0xA4;				// Load with A4 to request twi_rxBuffer[0]
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, count=: %02X\n",buffer);
-  buffer = 0xA5;				// Load with A5 to request twi_rxBuffer[1]
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, twi_rxBuffer[0]=: %02X\n",buffer);
-  buffer = 0xA6;				// Load with A6 to request twi_txBuffer[0]
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, twirtxBuffer[1]=: %02X\n",buffer);
-  buffer = 0xA7;				// Load with A7 to request twi_txBuffer[1]
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, twi_txBuffer[0]=: %02X\n",buffer);
-  buffer = 0xA8;				// Load with A8 to request slask_rx1
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, twi_txBuffer[1]=: %02X\n",buffer);
-  buffer = 0xA9;				// Load with A9 to request slask_rx2
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, slask_rx1=: %02X\n",buffer);
-  buffer = 0xAA;				// Load with AA to request slask_tx1
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, slask_rx2=: %02X\n",buffer);
-  buffer = 0xAB;				// Load with AB to request slask_tx2
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, slask_tx1=: %02X\n",buffer);
-  buffer = 0xFF;				// Load with FF to send PING
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  fprintf(stderr, "Debug_msg, slask_tx2=: %02X\n",buffer);
+  tx_buffer = 0xA0;												// Load with A0 to request test1
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Send first command and receive whatever is in the buffer
+  fprintf(stderr, "Debug_msg, expect 0xAD: %02X\n", rx_buffer);	// Should be 0xAD if previous sample was successful
+  tx_buffer = 0xA1;												// Load with A1 to request test2
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, test1=: %u\n", rx_buffer);
+  tx_buffer = 0xA2;												// Load with A2 to request test3
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, test2=: %u\n", rx_buffer);
+  tx_buffer = 0xA3;												// Load with A3 to request count
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, test3=: %u\n", rx_buffer);
+  tx_buffer = 0xA4;												// Load with A4 to request twi_rxBuffer[0]
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, count=: %02X\n", rx_buffer);
+  tx_buffer = 0xA5;												// Load with A5 to request twi_rxBuffer[1]
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, twi_rxBuffer[0]=: %02X\n", rx_buffer);
+  tx_buffer = 0xA6;												// Load with A6 to request twi_txBuffer[0]
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, twi_rxBuffer[1]=: %02X\n", rx_buffer);
+  tx_buffer = 0xA7;												// Load with A7 to request twi_txBuffer[1]
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, twi_txBuffer[0]=: %02X\n", rx_buffer);
+  tx_buffer = 0xA8;												// Load with A8 to request slask_rx1
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, twi_txBuffer[1]=: %02X\n", rx_buffer);
+  tx_buffer = 0xA9;												// Load with A9 to request slask_rx2
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, slask_rx1=: %02X\n", rx_buffer);
+  tx_buffer = 0xAA;												// Load with AA to request slask_tx1
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, slask_rx2=: %02X\n", rx_buffer);
+  tx_buffer = 0xAB;												// Load with AB to request slask_tx2
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, slask_tx1=: %02X\n", rx_buffer);
+  tx_buffer = 0xFF;												// Load with FF to send NO-OP/PING
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
+  fprintf(stderr, "Debug_msg, slask_tx2=: %02X\n", rx_buffer);
   fprintf(stderr, "Debug_msg, samples=: %u\n",test4);
   fprintf(stderr, "Debug_msg, duplicate_count=: %u\n",duplicate_count);
   fprintf(stderr, "------------------------------------------\n");
@@ -287,7 +419,7 @@ void debug_msg(void)
 
 int trySPIcon(void)
 {
-  if (digitalRead(INT_PIN) == 1)		// Check if we somehow missed the interrupt
+  if (digitalRead(INT_PIN) == 1)				// Check if we somehow missed the interrupt
   {
     fprintf(stderr, "TrySPI: Somehow we have missed the interrupt, execute NOW!\n");
     myInterrupt();
@@ -306,11 +438,11 @@ int trySPIcon(void)
     debug_msg();
 
     // Check SPI transmission
-    buffer = 0xF2;				// Load with F2 to request TWI RESET
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command, probably 0xAD if previous sample was OK
-    buffer = 0xFF;				// Load with FF to send PING
-    wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-    switch(buffer)
+    tx_buffer = 0xF2;							// Load with F2 to request TWI RESET
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command, probably 0xAD if previous sample was OK
+    tx_buffer = 0xFF;							// Load with FF to send PING
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
+    switch(rx_buffer)
     {
       case 0x00:
         fprintf(stderr, "TrySPI: AVR is out of I2C_SYNC with CTC!\n");
@@ -321,7 +453,7 @@ int trySPIcon(void)
         return 1;
 
       default:
-        fprintf(stderr, "TrySPI: Strange fault: %u\n", buffer);
+        fprintf(stderr, "TrySPI: Strange fault: %u\n", rx_buffer);
         return 1;
     }
   }
@@ -329,57 +461,108 @@ int trySPIcon(void)
 
 void init_arrays(void)
 {
-  // Open sample_template file and load fresh values
-  FILE *sp;
-  sp = fopen(SAMPLE_TEMPLATE, "r");
-  int data,inc,count = 0;
+  // Open file containing the sample templare and load fresh values
+  FILE *fp;
+  if ((fp = fopen(SAMPLE_TEMPLATE, "r")) == NULL)
+  {
+    perror("INIT_ARRAYS");
+    exit(EXIT_FAILURE);
+  }
+
+  // Make initial room for the array holding the sample template
+  if ((sample_template = (uint8_t*)calloc(0, sizeof(uint8_t))) == NULL)
+  {
+    perror("INIT_ARRAYS");
+    fclose(fp);
+    exit(EXIT_FAILURE);
+  }
+
+  int data, count = 0;
   char ch;
 
-  // First read the size of the sample_template array
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  array_size = data;
-
-  // Make more room for arrays
-  datalog=(uint8_t*)realloc(datalog,sizeof(uint8_t)*array_size);
-  sample_template=(uint8_t*)realloc(sample_template,sizeof(uint8_t)*array_size);
-
-  // Read size of area1
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  settings = data;
-
-  // Read size of area2
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  systime = settings+data;
-
-  // Read size of area3
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  historical = systime+data;
-
-  // Read size of area4
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  current = historical+data;
-
-  // Read size of area5
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  alarms = current+data;
-
-  // Read size of area6
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  last24h = alarms+data;
-
-  // Read size of area7
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  status = last24h+data;
-
-  // Read size of area8
-  fscanf(sp,"%x%c", &data, &ch);		// Read one HEX value and a char(,)
-  temperature = status+data;
-
-  // Store sample_template in array
-  while(EOF != (inc = fscanf(sp,"%x%c", &data, &ch)) && inc == 2)	// Read HEX values until EOF
+  // Store SETTINGS in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
     sample_template[count++] = data;
+  }
+  settings = count;
+  ch = 0;
 
-  fclose(sp);
+  // Store SYSTIME in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
+    sample_template[count++] = data;
+  }
+  systime = count;
+  ch = 0;
+
+  // Store HISTORICAL in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
+    sample_template[count++] = data;
+  }
+  historical = count;
+  ch = 0;
+
+  // Store CURRENT in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
+    sample_template[count++] = data;
+  }
+  current = count;
+  ch = 0;
+
+  // Store ALARMS in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
+    sample_template[count++] = data;
+  }
+  alarms = count;
+  ch = 0;
+
+  // Store LAST_24H in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
+    sample_template[count++] = data;
+  }
+  last24h = count;
+  ch = 0;
+
+  // Store STATUS in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
+    sample_template[count++] = data;
+  }
+  status = count;
+  ch = 0;
+
+  // Store ONEWIRE in array
+  while(ch != ':' && EOF != fscanf(fp,"%x%c", &data, &ch))	// Read HEX values until ":"
+  {
+    sample_template = realloc(sample_template, count+1);
+    sample_template[count++] = data;
+  }
+  temperature = count;
+
+  // Total array size
+  array_size = count;
+
+  // Make room for the array holding the sampled values
+  if ((datalog = (uint8_t*)calloc(array_size, sizeof(uint8_t))) == NULL)
+  {
+    perror("INIT ARRAYS");
+    fclose(fp);
+    exit(EXIT_FAILURE);
+  }
+
+  fclose(fp);
 }
 
 int find_reg(uint8_t reg)
@@ -398,18 +581,21 @@ void finish_with_error(MYSQL *conn)
   fprintf(stderr, "MySQL error: %s\n", (char*) mysql_error(conn));
   mysql_close(conn);
   free(datalog);
+  datalog = NULL;
   free(sample_template);
+  sample_template = NULL;
   close(readfd);
+  close(spihandle);
   exit(EXIT_FAILURE);
 }
 
 uint8_t test_spi(uint8_t val)
 {
-  buffer = 0xFF;
-  wiringPiSPIDataRW(0,&buffer,1);
-  buffer = sample_template[val];
-  wiringPiSPIDataRW(0,&buffer,1);
-  if (buffer == 0x01)
+  tx_buffer = 0xFF;
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  tx_buffer = sample_template[val];
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  if (rx_buffer == 0x01)
     return 0;
   else
     return 1;
@@ -417,55 +603,66 @@ uint8_t test_spi(uint8_t val)
 
 uint8_t get_sample(uint8_t start, uint8_t stop)
 {
-  buffer = sample_template[start];
-  wiringPiSPIDataRW(0,&buffer,1);
-  if (buffer == 0x01)
+  tx_buffer = sample_template[start];
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  usleep(1);						// Short delay to allow AVR to prepare the ISR correctly
+/*
+  if (rx_buffer == 0x01)
     if (test_spi(start) == 0)
     {
       fprintf(stderr, "Get_sample: No sample available error! %02X\n", stop);
       int_active = 0;
       return 0;
     }
-
+*/
   // Every C prog must have an x counter
   uint8_t x;
 
   for (x = start+1 ; x < stop ; x++)
   {
-    buffer = sample_template[x];
-    if (wiringPiSPIDataRW(0,&buffer,1) < 0)
-      fprintf(stderr, "Get_sample: Error when calling wiringPiSPIDataRW: %s\n", strerror(errno));
+    tx_buffer = sample_template[x];
+    if (spiTxRx(spihandle, &tx_buffer, &rx_buffer) < 0)
+      perror("Get_sample: Error when calling spiTxRx");
 
-    if (buffer == sample_template[x-1])		// Check if we got back a copy of what we sent
+    if (rx_buffer == sample_template[x-1])		// Check if we got back a copy of what we sent
     {
-      fprintf(stderr, "Get_sample: Duplicate answer from register: %02X\n", buffer);
-      buffer = sample_template[x-1];
-      usleep(1);				// Short delay to allow AVR to catch up
-      wiringPiSPIDataRW(0,&buffer,1);
-      buffer = sample_template[x];
-      wiringPiSPIDataRW(0,&buffer,1);
+      fprintf(stderr, "Get_sample: Duplicate answer from register: %02X\n", rx_buffer);
+      fprintf(stderr, "Get_sample: X: %u\n", x);
+      fprintf(stderr, "Get_sample: Start: %u\n", start);
+      fprintf(stderr, "Get_sample: Stop: %u\n", stop);
+      tx_buffer = sample_template[x-1];
+      spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+      tx_buffer = sample_template[x];
+      usleep(1);								// Short delay to allow AVR to catch up
+      spiTxRx(spihandle, &tx_buffer, &rx_buffer);
       duplicate_count++;
     }
-    datalog[x-1] = buffer;
+    datalog[x-1] = rx_buffer;
   }
-  buffer = 0xFF;				// Send as NO-OP
-  wiringPiSPIDataRW(0,&buffer,1);
-  if (buffer == sample_template[stop-1])	// Check if we got back a copy of what we sent
+  tx_buffer = 0xFF;								// Send as NO-OP
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  if (rx_buffer == sample_template[stop-1])		// Check if we got back a copy of what we sent
   {
-    fprintf(stderr, "Get_sample: Duplicate answer from register: %02X\n", buffer);
-    buffer = sample_template[stop-1];
-    usleep(1);					// Short delay to allow AVR to catch up
-    wiringPiSPIDataRW(0,&buffer,1);
-    buffer = 0xFF;
-    wiringPiSPIDataRW(0,&buffer,1);
+    fprintf(stderr, "Get_sample: Duplicate answer from register: %02X\n", rx_buffer);
+    fprintf(stderr, "Get_sample: X: %u\n", x);
+    fprintf(stderr, "Get_sample: Start: %u\n", start);
+    fprintf(stderr, "Get_sample: Stop: %u\n", stop);
+    tx_buffer = sample_template[stop-1];
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+    tx_buffer = 0xFF;
+    usleep(1);									// Short delay to allow AVR to catch up
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
     duplicate_count++;
   }
-  datalog[stop-1] = buffer;
+  datalog[stop-1] = rx_buffer;
   return 1;
 }
 
 void myInterrupt(void)
 {
+  tick_2 = clock();		// Get current tick
+  tick_3 = tick_2 - tick_1;	// Calculate how many ticks have elapsed since last time
+
   // Check if we somehow have called this procedure already...
   if (int_active == 1)
   {
@@ -477,30 +674,31 @@ void myInterrupt(void)
   if (digitalRead(INT_PIN) == 0)
   {
     fprintf(stderr, "ISR: Interrupt pin is not active!\n");
+    fprintf(stderr, "ISR: Tick_3: %ld\n", tick_3);
     return;
   }
   // Set watchdog flag to indicate we're handling this IRQ
   int_active = 1;
 
   // Load SPI buffer with SAMPLE_DUMP command
-  buffer = 0xF0;
-  wiringPiSPIDataRW(0,&buffer,1);	// Send first command and recieve whatever is in the buffer
+  tx_buffer = 0xF0;
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Send first command and recieve whatever is in the buffer
 
-  if (buffer != 0xAD && buffer != 0xAF && buffer != 0x01 && buffer != 0xFF)
-    fprintf(stderr, "ISR: Throwaway value: %02X\n", buffer);
+  if (rx_buffer != 0xAD && rx_buffer != 0xAF && rx_buffer != 0x01 && rx_buffer != 0xFF)
+    fprintf(stderr, "ISR: Throwaway value: %02X\n", rx_buffer);
 
-  buffer = 0xFE;			// Load with 0xFE to command next reply to be how many blocks to expect, if any
-  wiringPiSPIDataRW(0,&buffer,1);	// Buffer should contain answer to previous send command
+  tx_buffer = 0xFE;								// Load with 0xFE to command next reply to be how many blocks to expect, if any
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
 
   // Reset watchdog flags for SPI connection alive
   conn_alive = 1;
   error_count = 0;
 
   // Set time vars
-  time_1 = time(NULL);
-  diff_i = time_1 - time_2;
-  diff_s = time_1 - time_3;
-  time_2 = time_1;
+  time_1 = time(NULL);		// Get current time
+  diff_i = time_1 - time_2;	// Time since we last were here, i.e. between interrupts
+  diff_s = time_1 - time_3;	// Time since we started a new 70 sec waiting period
+  time_2 = time_1;			// Set time to now
 
   // Debug code
   if (dbg)
@@ -510,44 +708,41 @@ void myInterrupt(void)
   }
 
   // Check if SAMPLE_DUMP command was acknowledged
-  if (buffer != 0xF0)
+  if (rx_buffer != 0xF0)
   {
 
-    if (buffer != 0xF0)
-      fprintf(stderr, "ISR: SAMPLE_DUMP not ack'd: %02X\n", buffer);
-    buffer = 0xFF;
-    wiringPiSPIDataRW(0,&buffer,1);	// Send first command and recieve whatever is in the buffer
+    if (rx_buffer != 0xF0)
+      fprintf(stderr, "ISR: SAMPLE_DUMP not ack'd: %02X\n", rx_buffer);
+    tx_buffer = 0xFF;
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Send first command and receive whatever is in the buffer
 
-    if (buffer != 0xFE)
-      fprintf(stderr, "ISR: Expect FE: %02X\n", buffer);
+    if (rx_buffer != 0xFE)
+      fprintf(stderr, "ISR: Expect FE: %02X\n", rx_buffer);
 
-    buffer = 0xFE;			// Load with 0xFE to command next reply to be how many blocks to expect, if any
-    wiringPiSPIDataRW(0,&buffer,1);	// Buffer should contain answer to previous send command
+    tx_buffer = 0xFE;							// Load with 0xFE to command next reply to be how many blocks to expect, if any
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
 
-    if (buffer != 0xFF)
-      fprintf(stderr, "ISR: Expect FF: %02X\n", buffer);
+    if (rx_buffer != 0xFF)
+      fprintf(stderr, "ISR: Expect FF: %02X\n", rx_buffer);
 
-    if (buffer != 0xFF)
+    if (rx_buffer != 0xFF)
     {
-      fprintf(stderr, "ISR: Sample collection returned error: %02X\n", buffer);
+      fprintf(stderr, "ISR: Sample collection returned error: %02X\n", rx_buffer);
       int_active = 0;
-      buffer = 0xAD;
-      wiringPiSPIDataRW(0,&buffer,1);
+      tx_buffer = 0xF0;
+      spiTxRx(spihandle, &tx_buffer, &rx_buffer);
       return;
     }
   }
-
-  // String to use for building MySQL query, last time I checked it was 1044 chars... So remember to add if needed
-  char sql_string[1050];
 
   // Every C prog must have an x counter... and a y variable
   uint8_t x,y;
 
   // Check how many blocks to expect from AVR
-  buffer = 0xFF;			// Send as NO-OP / PING
-  wiringPiSPIDataRW(0,&buffer,1);
+  tx_buffer = 0xFF;				// Send as NO-OP / PING
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
-  int sample_sent = buffer;
+  int sample_sent = rx_buffer;
 
   // If SYSTIME has changed, make sure we get a CURRENT sample also
   if (sample_sent & 1)
@@ -579,53 +774,69 @@ void myInterrupt(void)
     if(!get_sample(status, temperature))
       return;
 
-  buffer = 0xF0;			// Signal end of sample sending
-  wiringPiSPIDataRW(0,&buffer,1);
+  tx_buffer = 0xF0;				// Signal end of sample sending
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  usleep(1);					// Small delay to ensure AVR acknowledges the command
 
   // Debug code
-  buffer = 0xA1;				// Load with A1 to request test2
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  test4 = buffer;
-  if (secs > 0)
-    secs = (secs + (float)diff_i/test4) / 2;
-  else
-  {
-    secs = (float)diff_i/test4;
-    fprintf(stderr, "ISR: Secs= %.2f\n", secs);
-  }
-
+  tx_buffer = 0xA1;									// Load with A1 to request test2
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Buffer should contain answer to previous send command
+  test4 = rx_buffer;
+  if (test4 > 0)
+    if (secs > 0)
+      secs = (secs + (float)diff_i/test4) / 2;		// Calculate how many seconds in average between samples
+    else
+    {
+      secs = (float)diff_i/test4;						// Set a baseline value for further calculations
+      fprintf(stderr, "ISR: Secs= %.2f\n", secs);
+    }
   if (dbg)
     fprintf(stderr, "ISR: Seconds between= %.2f\n", (float)diff_i/test4);
 
-  buffer = 0xFF;				// Load with FF to PING
-  wiringPiSPIDataRW(0,&buffer,1);		// Buffer should contain answer to previous send command
-  if (buffer > 0 && buffer != 64)		// Buffer contains test2, if test2 > 0, then an error has occured
+  tx_buffer = 0xFF;									// Load with FF to PING
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Buffer should contain answer to previous send command
+  if (rx_buffer == 0xA1)
   {
-    fprintf(stderr, "ISR: test2 check= %2u\n", buffer);
+    usleep(2);
+    tx_buffer = 0xA1;
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+    usleep(2);
+    tx_buffer = 0xFF;						// Load with FF to PING
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
+  }
+  if (rx_buffer > 0 && rx_buffer != 64)				// Buffer contains test2, if test2 > 0, then an error has occured
+  {
+    fprintf(stderr, "ISR: test2 check= %2u\n", rx_buffer);
     debug_msg();
   }
-  if (buffer & 64)
+  if (rx_buffer & 64)
   {
-    buffer = 0xA0;
-    wiringPiSPIDataRW(0,&buffer,1);
-    buffer = 0xFF;
-    wiringPiSPIDataRW(0,&buffer,1);
-    if (err_ratio > 0)
-      err_ratio = (err_ratio + (float)buffer/test4) / 2;
-    else
-    {
-      err_ratio = (float)buffer/test4;
-      fprintf(stderr, "ISR: Err_ratio= %.2f\n", err_ratio);
-    }
+    tx_buffer = 0xA0;						// Load with A0 to request test1 (# of TWI bus error due to illegal START or STOP condition)
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+    tx_buffer = 0xFF;
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+    if (test4 > 0)
+      if (err_ratio > 0)
+        err_ratio = (err_ratio + (float)rx_buffer/test4) / 2;
+      else
+      {
+        err_ratio = (float)rx_buffer/test4;
+        fprintf(stderr, "ISR: Err_ratio= %.2f\trx_buff= %u\ttest4= %u\n", err_ratio, rx_buffer, test4);
+      }
   }
-  buffer = 0xAF;
-  wiringPiSPIDataRW(0,&buffer,1);
+  tx_buffer = 0xAF;
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
   // Write downloaded array to files with some formatting to fit better into SQL database
   FILE *fp;
 
+  // String to use for building MySQL query, last time I checked it was 1044 chars... So remember to add if needed
+  char sql_string[700];  // Change to 691 if successful
+  char temp_string[120];
+
   // SYSTIME table
-  sprintf(sql_string, "INSERT INTO TIME VALUES(NULL,NULL,'%02u:%02u',%u,%u);", datalog[systime-4], datalog[systime-3], datalog[systime-2], datalog[systime-1]);
+  sprintf(sql_string, "INSERT INTO TIME VALUES(NULL,NULL,'%02u:%02u',%u,%u);", datalog[settings], datalog[settings+1], datalog[settings+2], datalog[settings+3]);
+  // Max string length = (53+1) = 54
 
   // SETTINGS table
   if (sample_sent & 8)
@@ -655,11 +866,13 @@ void myInterrupt(void)
     fprintf(fp, "%u", datalog[x]);
     fclose(fp);
     strcat(sql_string, "DELETE FROM SETTINGS; LOAD DATA INFILE '/tmp/settings.csv' INTO TABLE SETTINGS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+    // String length = (158+1) = 159	
   }
 
   // HISTORICAL table
   if (sample_sent & 4)
   {
+/*
     fp = fopen("/tmp/historical.csv", "w");
     fprintf(fp,"NULL,");
     fprintf(fp,"%02u%02u%02u,", find_reg(0x78),find_reg(0x77),find_reg(0x76));
@@ -670,11 +883,16 @@ void myInterrupt(void)
     fprintf(fp,"%u", find_reg(0x84));
     fclose(fp);
     strcat(sql_string, "DELETE FROM HISTORICAL; LOAD DATA INFILE '/tmp/historical.csv' INTO TABLE HISTORICAL FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+*/	
+	sprintf(temp_string, "DELETE FROM HISTORICAL; INSERT INTO HISTORICAL VALUES(LAST_INSERT_ID(),%02u%02u%02u,%u,%02u%02u%02u,%u,%u,%u,%u,%u);",datalog[systime],datalog[systime+1],datalog[systime+2],datalog[systime+3],datalog[systime+4],datalog[systime+5],datalog[systime+6],datalog[systime+7],datalog[systime+8],datalog[systime+9],datalog[systime+10],datalog[systime+11]);
+	strcat(sql_string, temp_string);  // Max temp_string length = (68+48+1) = 117
   }
+  
 
   // CURRENT table
   if (sample_sent & 2)
   {
+/*
     fp = fopen("/tmp/current.csv", "w");
     fprintf(fp,"NULL,");
     for (x=historical ; x < current-1 ; x++)
@@ -694,47 +912,69 @@ void myInterrupt(void)
     fprintf(fp, "%u", datalog[x]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/current.csv' INTO TABLE CURRENT FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+*/	
+	sprintf(temp_string, "INSERT INTO CURRENT VALUES(LAST_INSERT_ID(),%d,%u.%u,%.1f,%u,%u,%u,%u,%d,%d,%u);",datalog[historical]-40,datalog[historical+1],datalog[historical+2],(float)datalog[historical+3]/2,datalog[historical+4],datalog[historical+5],datalog[historical+6],datalog[historical+7],datalog[historical+8]-40,datalog[historical+9]-40,datalog[historical+10]);
+	strcat(sql_string, temp_string);  // Max temp_string length = (41+52+1) = 94
   }
 
   // ONEWIRE table
   if (sample_sent & 128)
   {
+/*
     fp = fopen("/tmp/onewire.csv", "w");
-    fprintf(fp,"NULL,");
+    fprintf(fp,"NULL");
     for (x=status ; x < temperature-1 ; x=x+2)
-      fprintf(fp, "%u.%02u", datalog[x], datalog[x+1]);
+    {
+      fprintf(fp, ",");
+      fprintf(fp, "%u.%02u", datalog[x], datalog[x+1]);		// OK to use unsigned since this we can never have negative temp in the heating system...
+    }
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/onewire.csv' INTO TABLE ONEWIRE FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+*/	
+	sprintf(temp_string, "INSERT INTO ONEWIRE VALUES(LAST_INSERT_ID(),%u.%02u,%u.%02u,%u.%02u,%u.%02u,%u.%02u,%u.%02u);",datalog[status],datalog[status+1],datalog[status+2],datalog[status+3],datalog[status+4],datalog[status+5],datalog[status+6],datalog[status+7],datalog[status+8],datalog[status+9],datalog[status+10],datalog[status+11]); 
+	strcat(sql_string, temp_string);  // Max temp_string length = (41+52+1) = 94
   }
 
   // ALARMS table
   if (sample_sent & 16)
   {
+/*
     fp = fopen("/tmp/alarms.csv", "w");
     fprintf(fp,"NULL,");
     fprintf(fp, "%u,%u,%u,%u", datalog[alarms-4],datalog[alarms-3],datalog[alarms-2],datalog[alarms-1]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/alarms.csv' INTO TABLE ALARMS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+*/	
+	sprintf(temp_string, "INSERT INTO ALARMS VALUES(LAST_INSERT_ID(),%u,%u,%u,%u);",datalog[current],datalog[current+1],datalog[current+2],datalog[current+3]); 
+	strcat(sql_string, temp_string);  // Max temp_string length = (39+20+1) = 60
   }
 
   // LAST_24H table
   if (sample_sent & 32)
   {
+/*
     fp = fopen("/tmp/last_24h.csv", "w");
     fprintf(fp,"NULL,");
     fprintf(fp,"%02u:%02u,%u", find_reg(0x86),find_reg(0x85),find_reg(0x7F));
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/last_24h.csv' INTO TABLE LAST_24H FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+*/
+	sprintf(temp_string, "INSERT INTO LAST_24H VALUES(LAST_INSERT_ID(),'%02u:%02u',%u);", datalog[alarms], datalog[alarms+1], datalog[alarms+2]);
+    strcat(sql_string, temp_string);  // Max temp_string length = (42+16+1) = 59
   }
 
   // STATUS table
   if (sample_sent & 64)
   {
+/*
     fp = fopen("/tmp/status.csv", "w");
     fprintf(fp,"NULL,");
     fprintf(fp, "%u,%u,%u,%u", datalog[status-4],datalog[status-3],datalog[status-2],datalog[status-1]);
     fclose(fp);
     strcat(sql_string, "LOAD DATA INFILE '/tmp/status.csv' INTO TABLE STATUS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
+*/	
+	sprintf(temp_string, "INSERT INTO STATUS VALUES(LAST_INSERT_ID(),%u,%u,%u,%u);", datalog[last24h],datalog[last24h+1],datalog[last24h+2],datalog[last24h+3]);
+    strcat(sql_string, temp_string);  // Max temp_string length = (40+20+1) = 61
   }
 
   // MySQL magic happens here...
@@ -752,4 +992,6 @@ void myInterrupt(void)
 
   // Set watchdog flag to indicate we're finished
   int_active = 0;
+
+  tick_1 = clock();
 }
