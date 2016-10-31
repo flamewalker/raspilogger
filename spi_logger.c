@@ -65,6 +65,8 @@ uint8_t dhw = 0;
 uint8_t dbg = 0;
 uint8_t duplicate_count, test4 = 0;
 float err_ratio = 0.0;
+uint32_t tot_samples = 0;
+uint32_t tot_error = 0;
 float secs = 0.0;
 
 // Function declarations
@@ -83,8 +85,6 @@ void debug_msg(void);
 int trySPIcon(void);
 
 void init_arrays(void);
-
-int find_reg(uint8_t);
 
 uint8_t get_sample(uint8_t, uint8_t);
 
@@ -108,8 +108,6 @@ int main(void)
   digitalWrite(RESET_PIN, HIGH);
   pinMode(DHW_PIN, OUTPUT);
   digitalWrite(DHW_PIN, LOW);
- // pinMode(INT_PIN, INPUT);
- // pullUpDnControl(INT_PIN, PUD_OFF);
 
   // Initialize SPI communication
   spihandle = open(device, O_RDWR);
@@ -125,9 +123,9 @@ int main(void)
       exit(EXIT_FAILURE);
     }
   readfd = open(FIFO_NAME, O_RDONLY | O_NONBLOCK);	// Open FIFO in read-only, non-blocking mode
-  fcntl(readfd, F_SETOWN, getpid());			// Connect the FIFO to this programs PID
-  fcntl(readfd, F_SETFL, O_ASYNC);			// Set the O_ASYNC on the FIFO
-  signal(SIGIO, fifo_reader);				// Register our handler of SIGIO
+  fcntl(readfd, F_SETOWN, getpid());				// Connect the FIFO to this programs PID
+  fcntl(readfd, F_SETFL, O_ASYNC);					// Set the O_ASYNC on the FIFO
+  signal(SIGIO, fifo_reader);						// Register our handler of SIGIO
 
   init_arrays();
 
@@ -166,7 +164,7 @@ int main(void)
     // Debug code
     if (dbg)
       fprintf(stderr, "Debug msg, Sleep ( %u )\n", diff_t);
-  
+
     // DHW code
 	if (dhw)
 	  if ((time_3 - dhw_start) > 180)	// If 180 seconds have passed since we started DHW production
@@ -176,7 +174,7 @@ int main(void)
 	    set_temp(60);
 		fprintf(stderr, "DHW stop\n");
 	  }
-	
+
     if ((sleep(diff_t)) == 0)
     {
       if (conn_alive == 1)				// Check if the SPI communication has been active in the last 70 seconds
@@ -243,17 +241,20 @@ void fifo_reader(int signum)
             break;
 
           case 0xB1:
-            fprintf(stderr, "Debug_msg, err_ratio=: %.2f\n", err_ratio);
+            err_ratio = (float)tot_error / (float)tot_samples * 100.0;
+            fprintf(stderr, "Debug_msg, err_ratio=: %.4f%\n", err_ratio);
+            fprintf(stderr, "Debug_msg, tot_error=: %u\n", tot_error);
+            fprintf(stderr, "Debug_msg, tot_samples=: %u\n", tot_samples);
             fprintf(stderr, "Debug_msg, secs=: %.2f\n", secs);
             break;
-			
+
 		  case 0xB2:
 		  	dbg = !dbg;
             fprintf(stderr, "DEBUG MODE: %u\n", dbg);
             if (dbg)
               debug_msg();
 		    break;
-			
+
 		  case 0xB3:
 		  	digitalWrite(DHW_PIN, HIGH);
 		  	fprintf(stderr, "DHW start\n");
@@ -261,7 +262,7 @@ void fifo_reader(int signum)
 			set_temp(30);
 			dhw_start = time(NULL);
 			break;
-	  
+
           default:
 		    if (cmd >= 0xA0 && cmd <= 0xAF)
             {
@@ -279,7 +280,7 @@ void fifo_reader(int signum)
 			}
         }
 	    break;
-		
+
 	  case 6:		// command and argument (HEX HEX/UINT)
         sscanf(str, "%x%x", &cmd, &arg);
         if (cmd >= 0xDC && cmd <= 0xDE)
@@ -298,7 +299,7 @@ void fifo_reader(int signum)
 		  }
         }
 		break;
-		
+
       default:		// possibly command, argument and data (HEX UINT UINT)
         sscanf(str, "%x%u%u", &cmd, &arg, &data);
         if (cmd == 0xF3)
@@ -375,7 +376,7 @@ void debug_msg(void)
   // Load SPI transmission buffer
   tx_buffer = 0xA0;												// Load with A0 to request test1
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Send first command and receive whatever is in the buffer
-  fprintf(stderr, "Debug_msg, expect 0xAD: %02X\n", rx_buffer);	// Should be 0xAD if previous sample was successful
+  fprintf(stderr, "Debug_msg, expect 0xAF: %02X\n", rx_buffer);			// Should be 0xAF if previous sample was successful
   tx_buffer = 0xA1;												// Load with A1 to request test2
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
   fprintf(stderr, "Debug_msg, test1=: %u\n", rx_buffer);
@@ -439,7 +440,8 @@ int trySPIcon(void)
 
     // Check SPI transmission
     tx_buffer = 0xF2;							// Load with F2 to request TWI RESET
-    spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command, probably 0xAD if previous sample was OK
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command, probably 0xAF if previous sample was OK
+	usleep(1);									// Short delay to allow AVR to catch up
     tx_buffer = 0xFF;							// Load with FF to send PING
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
     switch(rx_buffer)
@@ -565,17 +567,6 @@ void init_arrays(void)
   fclose(fp);
 }
 
-int find_reg(uint8_t reg)
-{
-  int i;
-  for (i = 0 ; i < array_size ; i++)
-  {
-    if (sample_template[i] == reg)
-      return datalog[i];
-  }
-  return 0xFF;
-}
-
 void finish_with_error(MYSQL *conn)
 {
   fprintf(stderr, "MySQL error: %s\n", (char*) mysql_error(conn));
@@ -593,6 +584,7 @@ uint8_t test_spi(uint8_t val)
 {
   tx_buffer = 0xFF;
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+  usleep(1);									// Short delay to allow AVR to catch up
   tx_buffer = sample_template[val];
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
   if (rx_buffer == 0x01)
@@ -606,15 +598,7 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
   tx_buffer = sample_template[start];
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
   usleep(1);						// Short delay to allow AVR to prepare the ISR correctly
-/*
-  if (rx_buffer == 0x01)
-    if (test_spi(start) == 0)
-    {
-      fprintf(stderr, "Get_sample: No sample available error! %02X\n", stop);
-      int_active = 0;
-      return 0;
-    }
-*/
+
   // Every C prog must have an x counter
   uint8_t x;
 
@@ -632,8 +616,8 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
       fprintf(stderr, "Get_sample: Stop: %u\n", stop);
       tx_buffer = sample_template[x-1];
       spiTxRx(spihandle, &tx_buffer, &rx_buffer);
-      tx_buffer = sample_template[x];
       usleep(1);								// Short delay to allow AVR to catch up
+      tx_buffer = sample_template[x];
       spiTxRx(spihandle, &tx_buffer, &rx_buffer);
       duplicate_count++;
     }
@@ -649,8 +633,8 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
     fprintf(stderr, "Get_sample: Stop: %u\n", stop);
     tx_buffer = sample_template[stop-1];
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
-    tx_buffer = 0xFF;
     usleep(1);									// Short delay to allow AVR to catch up
+    tx_buffer = 0xFF;
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
     duplicate_count++;
   }
@@ -710,7 +694,6 @@ void myInterrupt(void)
   // Check if SAMPLE_DUMP command was acknowledged
   if (rx_buffer != 0xF0)
   {
-
     if (rx_buffer != 0xF0)
       fprintf(stderr, "ISR: SAMPLE_DUMP not ack'd: %02X\n", rx_buffer);
     tx_buffer = 0xFF;
@@ -744,14 +727,13 @@ void myInterrupt(void)
 
   int sample_sent = rx_buffer;
 
-  // If SYSTIME has changed, make sure we get a CURRENT sample also
-  if (sample_sent & 1)
-    sample_sent |= 130;
-
   // Execute right amount of loops to receive correct number of blocks from AVR
   if (sample_sent & 1)			// SYSTIME block (Area 2)
+  {
+	sample_sent |= 130;			// If SYSTIME has changed, make sure we get a CURRENT and ONEWIRE sample also
     if(!get_sample(settings, systime))
       return;
+  }
   if (sample_sent & 2)			// CURRENT block (Area 4)
     if(!get_sample(historical, current))
       return;
@@ -779,28 +761,29 @@ void myInterrupt(void)
   usleep(1);					// Small delay to ensure AVR acknowledges the command
 
   // Debug code
-  tx_buffer = 0xA1;									// Load with A1 to request test2
-  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Buffer should contain answer to previous send command
+  tx_buffer = 0xA1;						// Load with A1 to request test2 which contains TWI error code
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
   test4 = rx_buffer;
+  tot_samples = tot_samples + test4;
   if (test4 > 0)
     if (secs > 0)
-      secs = (secs + (float)diff_i/test4) / 2;		// Calculate how many seconds in average between samples
+      secs = (secs + (float)diff_i/test4) / 2;			// Calculate how many seconds in average between samples
     else
     {
-      secs = (float)diff_i/test4;						// Set a baseline value for further calculations
+      secs = (float)diff_i/test4;				// Set a baseline value for further calculations
       fprintf(stderr, "ISR: Secs= %.2f\n", secs);
     }
   if (dbg)
     fprintf(stderr, "ISR: Seconds between= %.2f\n", (float)diff_i/test4);
 
-  tx_buffer = 0xFF;									// Load with FF to PING
-  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Buffer should contain answer to previous send command
+  tx_buffer = 0xFF;						// Load with FF to PING
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
   if (rx_buffer == 0xA1)
   {
-    usleep(2);
+    usleep(1);								// Short delay to allow AVR to catch up
     tx_buffer = 0xA1;
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
-    usleep(2);
+    usleep(1);								// Short delay to allow AVR to catch up
     tx_buffer = 0xFF;						// Load with FF to PING
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
   }
@@ -813,168 +796,159 @@ void myInterrupt(void)
   {
     tx_buffer = 0xA0;						// Load with A0 to request test1 (# of TWI bus error due to illegal START or STOP condition)
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
+    usleep(1);								// Short delay to allow AVR to catch up
     tx_buffer = 0xFF;
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
-    if (test4 > 0)
-      if (err_ratio > 0)
-        err_ratio = (err_ratio + (float)rx_buffer/test4) / 2;
-      else
-      {
-        err_ratio = (float)rx_buffer/test4;
-        fprintf(stderr, "ISR: Err_ratio= %.2f\trx_buff= %u\ttest4= %u\n", err_ratio, rx_buffer, test4);
-      }
+    if (tot_samples > 0)
+    {
+      tot_error = tot_error + rx_buffer;
+      err_ratio = (float)tot_error / (float)tot_samples * 100.0;
+      if (err_ratio > 0.1500)
+        fprintf(stderr, "ISR: Err_ratio= %.4f%\ttot_error= %u\ttot_samples= %u\n", err_ratio, tot_error, tot_samples);
+    }
   }
-  tx_buffer = 0xAF;
+
+  tx_buffer = 0xAF;							// Load with AF to end the SAMPLE_DUMP
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
-  // Write downloaded array to files with some formatting to fit better into SQL database
+  // If needed, write downloaded array to files complete with SQL
   FILE *fp;
 
-  // String to use for building MySQL query, last time I checked it was 1044 chars... So remember to add if needed
-  char sql_string[700];  // Change to 691 if successful
-  char temp_string[120];
+  // String to use for building MySQL query, remember to check max size when changing anything
+  char sql_string[1023];
+  char temp_string[491];
+  char tmp[13];
 
   // SYSTIME table
   sprintf(sql_string, "INSERT INTO TIME VALUES(NULL,NULL,'%02u:%02u',%u,%u);", datalog[settings], datalog[settings+1], datalog[settings+2], datalog[settings+3]);
-  // Max string length = (53+1) = 54
+  // Max string length = (41+12) = 53
 
-  // SETTINGS table
-  if (sample_sent & 8)
+  // CURRENT table
+  if (sample_sent & 2)
   {
-    fp = fopen("/tmp/settings.csv", "w");
-    fprintf(fp,"NULL,%.1f,", (float)datalog[0]/2);
-    for (x = 1 ; x < settings-1 ; x++)
+    sprintf(temp_string, "INSERT INTO CURRENT VALUES(LAST_INSERT_ID(),%d,%u.%u,%.1f,%u,%u,%u,%u,%d,%d,%u);",datalog[historical]-40,datalog[historical+1],datalog[historical+2],(float)datalog[historical+3]/2,datalog[historical+4],datalog[historical+5],datalog[historical+6],datalog[historical+7],datalog[historical+8]-40,datalog[historical+9]-40,datalog[historical+10]);
+    strcat(sql_string, temp_string);	// Max temp_string length = (56+35) = 91
+    if (dbg)
     {
-      y = sample_template[x];
-      if (y ==0x06 || y ==0x07 || y == 0x13 || y == 0x15 || y == 0x1E || y == 0x1F || y == 0x3A || y == 0x41)
-        fprintf(fp, "%d,", datalog[x]-40);
-      else
-	if (y == 0x31)
-	{
-	  fprintf(fp, "%u0,%u0,%u0,", datalog[x], datalog[x+1], datalog[x+2]);
-	  x = x+2;
-	}
-	else
-          if (y == 0x16)
-	  {
-            fprintf(fp, "%u%u%u,", datalog[x], datalog[x+1], datalog[x+2]);
- 	    x = x+2;
-	  }
-          else
-            fprintf(fp, "%u,", datalog[x]);
+      fp = fopen("/tmp/current.sql", "w");
+      fprintf(fp, temp_string);
+      fclose(fp);
     }
-    fprintf(fp, "%u", datalog[x]);
-    fclose(fp);
-    strcat(sql_string, "DELETE FROM SETTINGS; LOAD DATA INFILE '/tmp/settings.csv' INTO TABLE SETTINGS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
-    // String length = (158+1) = 159	
   }
 
   // HISTORICAL table
   if (sample_sent & 4)
   {
-/*
-    fp = fopen("/tmp/historical.csv", "w");
-    fprintf(fp,"NULL,");
-    fprintf(fp,"%02u%02u%02u,", find_reg(0x78),find_reg(0x77),find_reg(0x76));
-    fprintf(fp,"%u,", find_reg(0x87));
-    fprintf(fp,"%02u%02u%02u,", find_reg(0x7B),find_reg(0x7A),find_reg(0x79));
-    for (x=0x80 ; x < 0x84 ; x++)
-        fprintf(fp, "%u," , find_reg(x));
-    fprintf(fp,"%u", find_reg(0x84));
-    fclose(fp);
-    strcat(sql_string, "DELETE FROM HISTORICAL; LOAD DATA INFILE '/tmp/historical.csv' INTO TABLE HISTORICAL FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
-*/	
-	sprintf(temp_string, "DELETE FROM HISTORICAL; INSERT INTO HISTORICAL VALUES(LAST_INSERT_ID(),%02u%02u%02u,%u,%02u%02u%02u,%u,%u,%u,%u,%u);",datalog[systime],datalog[systime+1],datalog[systime+2],datalog[systime+3],datalog[systime+4],datalog[systime+5],datalog[systime+6],datalog[systime+7],datalog[systime+8],datalog[systime+9],datalog[systime+10],datalog[systime+11]);
-	strcat(sql_string, temp_string);  // Max temp_string length = (68+48+1) = 117
+    sprintf(temp_string, "DELETE FROM HISTORICAL;INSERT INTO HISTORICAL VALUES(LAST_INSERT_ID(),%02u%02u%02u,%u,%02u%02u%02u,%u,%u,%u,%u,%u);",datalog[systime],datalog[systime+1],datalog[systime+2],datalog[systime+3],datalog[systime+4],datalog[systime+5],datalog[systime+6],datalog[systime+7],datalog[systime+8],datalog[systime+9],datalog[systime+10],datalog[systime+11]);
+    strcat(sql_string, temp_string);	// Max temp_string length = (79+36) = 115
+    if (dbg)
+    {
+      fp = fopen("/tmp/historical.sql", "w");
+      fprintf(fp, temp_string);
+      fclose(fp);
+    }
   }
-  
 
-  // CURRENT table
-  if (sample_sent & 2)
+  // SETTINGS table
+  if (sample_sent & 8)
   {
-/*
-    fp = fopen("/tmp/current.csv", "w");
-    fprintf(fp,"NULL,");
-    for (x=historical ; x < current-1 ; x++)
+    sprintf(temp_string, "DELETE FROM SETTINGS;INSERT INTO SETTINGS VALUES(LAST_INSERT_ID(),%.1f,", (float)datalog[0]/2);
+    for (x = 1 ; x < settings-1 ; x++)
     {
       y = sample_template[x];
-      if (y == 0x8E || y == 0x94 || y == 0x95)
-        fprintf(fp, "%d," , datalog[x]-40);
+      if (y ==0x06 || y ==0x07 || y == 0x13 || y == 0x15 || y == 0x1E || y == 0x1F || y == 0x3A || y == 0x41)
+      {
+        sprintf(tmp, "%d,", datalog[x]-40);
+        strcat(temp_string, tmp);
+      }
       else
-        if (y == 0x8F)
-          fprintf(fp, "%u.%u,", datalog[x++], datalog[x]);
-        else
-          if (y == 0xAA)
-            fprintf(fp, "%.1f,", (float)datalog[x]/2);
-          else
-            fprintf(fp, "%u," , datalog[x]);
+	  if (y == 0x31)
+	  {
+	    sprintf(tmp, "%u0,%u0,%u0,", datalog[x], datalog[x+1], datalog[x+2]);
+        strcat(temp_string, tmp);
+	    x = x+2;
+	  }
+	  else
+      if (y == 0x16)
+	  {
+        sprintf(tmp, "%u%u%u,", datalog[x], datalog[x+1], datalog[x+2]);
+        strcat(temp_string, tmp);
+ 	    x = x+2;
+	  }
+      else
+      {
+        sprintf(tmp, "%u,", datalog[x]);
+        strcat(temp_string, tmp);
+      }
     }
-    fprintf(fp, "%u", datalog[x]);
-    fclose(fp);
-    strcat(sql_string, "LOAD DATA INFILE '/tmp/current.csv' INTO TABLE CURRENT FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
-*/	
-	sprintf(temp_string, "INSERT INTO CURRENT VALUES(LAST_INSERT_ID(),%d,%u.%u,%.1f,%u,%u,%u,%u,%d,%d,%u);",datalog[historical]-40,datalog[historical+1],datalog[historical+2],(float)datalog[historical+3]/2,datalog[historical+4],datalog[historical+5],datalog[historical+6],datalog[historical+7],datalog[historical+8]-40,datalog[historical+9]-40,datalog[historical+10]);
-	strcat(sql_string, temp_string);  // Max temp_string length = (41+52+1) = 94
-  }
-
-  // ONEWIRE table
-  if (sample_sent & 128)
-  {
-/*
-    fp = fopen("/tmp/onewire.csv", "w");
-    fprintf(fp,"NULL");
-    for (x=status ; x < temperature-1 ; x=x+2)
+    sprintf(tmp, "%u);", datalog[x]);
+    strcat(temp_string, tmp);
+    strcat(sql_string, temp_string);	// String length = (66+xx) = 490
+    if (dbg)
     {
-      fprintf(fp, ",");
-      fprintf(fp, "%u.%02u", datalog[x], datalog[x+1]);		// OK to use unsigned since this we can never have negative temp in the heating system...
+      fp = fopen("/tmp/settings.sql", "w");
+      fprintf(fp, temp_string);
+      fclose(fp);
     }
-    fclose(fp);
-    strcat(sql_string, "LOAD DATA INFILE '/tmp/onewire.csv' INTO TABLE ONEWIRE FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
-*/	
-	sprintf(temp_string, "INSERT INTO ONEWIRE VALUES(LAST_INSERT_ID(),%u.%02u,%u.%02u,%u.%02u,%u.%02u,%u.%02u,%u.%02u);",datalog[status],datalog[status+1],datalog[status+2],datalog[status+3],datalog[status+4],datalog[status+5],datalog[status+6],datalog[status+7],datalog[status+8],datalog[status+9],datalog[status+10],datalog[status+11]); 
-	strcat(sql_string, temp_string);  // Max temp_string length = (41+52+1) = 94
   }
 
   // ALARMS table
   if (sample_sent & 16)
   {
-/*
-    fp = fopen("/tmp/alarms.csv", "w");
-    fprintf(fp,"NULL,");
-    fprintf(fp, "%u,%u,%u,%u", datalog[alarms-4],datalog[alarms-3],datalog[alarms-2],datalog[alarms-1]);
-    fclose(fp);
-    strcat(sql_string, "LOAD DATA INFILE '/tmp/alarms.csv' INTO TABLE ALARMS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
-*/	
-	sprintf(temp_string, "INSERT INTO ALARMS VALUES(LAST_INSERT_ID(),%u,%u,%u,%u);",datalog[current],datalog[current+1],datalog[current+2],datalog[current+3]); 
-	strcat(sql_string, temp_string);  // Max temp_string length = (39+20+1) = 60
+    sprintf(temp_string, "INSERT INTO ALARMS VALUES(LAST_INSERT_ID(),%u,%u,%u,%u);",datalog[current],datalog[current+1],datalog[current+2],datalog[current+3]); 
+    strcat(sql_string, temp_string);	// Max temp_string length = (48+12) = 60
+    if (dbg)
+    {
+      fp = fopen("/tmp/alarms.sql", "w");
+      fprintf(fp, temp_string);
+      fclose(fp);
+    }
   }
 
   // LAST_24H table
   if (sample_sent & 32)
   {
-/*
-    fp = fopen("/tmp/last_24h.csv", "w");
-    fprintf(fp,"NULL,");
-    fprintf(fp,"%02u:%02u,%u", find_reg(0x86),find_reg(0x85),find_reg(0x7F));
-    fclose(fp);
-    strcat(sql_string, "LOAD DATA INFILE '/tmp/last_24h.csv' INTO TABLE LAST_24H FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
-*/
-	sprintf(temp_string, "INSERT INTO LAST_24H VALUES(LAST_INSERT_ID(),'%02u:%02u',%u);", datalog[alarms], datalog[alarms+1], datalog[alarms+2]);
-    strcat(sql_string, temp_string);  // Max temp_string length = (42+16+1) = 59
+    sprintf(temp_string, "INSERT INTO LAST_24H VALUES(LAST_INSERT_ID(),'%02u:%02u',%u);", datalog[alarms], datalog[alarms+1], datalog[alarms+2]);
+    strcat(sql_string, temp_string);	// Max temp_string length = (51+9) = 60
+    if (dbg)
+    {
+      fp = fopen("/tmp/last_24h.sql", "w");
+      fprintf(fp, temp_string);
+      fclose(fp);
+    }
   }
 
   // STATUS table
   if (sample_sent & 64)
   {
-/*
-    fp = fopen("/tmp/status.csv", "w");
-    fprintf(fp,"NULL,");
-    fprintf(fp, "%u,%u,%u,%u", datalog[status-4],datalog[status-3],datalog[status-2],datalog[status-1]);
+    sprintf(temp_string, "INSERT INTO STATUS VALUES(LAST_INSERT_ID(),%u,%u,%u,%u);", datalog[last24h],datalog[last24h+1],datalog[last24h+2],datalog[last24h+3]);
+    strcat(sql_string, temp_string);	// Max temp_string length = (48+12) = 60
+    if (dbg)
+    {
+      fp = fopen("/tmp/status.sql", "w");
+      fprintf(fp, temp_string);
+      fclose(fp);
+    }
+  }
+
+  // ONEWIRE table
+  if (sample_sent & 128)
+  {
+    sprintf(temp_string, "INSERT INTO ONEWIRE VALUES(LAST_INSERT_ID(),%u.%02u,%u.%02u,%u.%02u,%u.%02u,%u.%02u,%u.%02u);",datalog[status],datalog[status+1],datalog[status+2],datalog[status+3],datalog[status+4],datalog[status+5],datalog[status+6],datalog[status+7],datalog[status+8],datalog[status+9],datalog[status+10],datalog[status+11]); 
+    strcat(sql_string, temp_string);	// Max temp_string length = (57+36) = 93
+    if (dbg)
+    {
+      fp = fopen("/tmp/onewire.sql", "w");
+      fprintf(fp, temp_string);
+      fclose(fp);
+    }
+  }
+
+  if (dbg)
+  {
+    fp = fopen("/tmp/total.sql", "w");
+    fprintf(fp, sql_string);
     fclose(fp);
-    strcat(sql_string, "LOAD DATA INFILE '/tmp/status.csv' INTO TABLE STATUS FIELDS TERMINATED BY ',' LINES TERMINATED BY '\n' SET log_idx=LAST_INSERT_ID();");
-*/	
-	sprintf(temp_string, "INSERT INTO STATUS VALUES(LAST_INSERT_ID(),%u,%u,%u,%u);", datalog[last24h],datalog[last24h+1],datalog[last24h+2],datalog[last24h+3]);
-    strcat(sql_string, temp_string);  // Max temp_string length = (40+20+1) = 61
   }
 
   // MySQL magic happens here...
