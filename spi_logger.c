@@ -116,16 +116,21 @@ int main(void)
   ioctl (spihandle, SPI_IOC_WR_MODE, &mode);
 
   // Initialize the FIFO for commands
-  if (access(FIFO_NAME, F_OK) == -1)								// Check if FIFO already exists
-    if (mkfifo(FIFO_NAME, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IWOTH | S_IROTH) != 0)	// If not, then create FIFO
+  if (access(FIFO_NAME, F_OK) == -1)					// Check if FIFO already exists
+    if (mkfifo(FIFO_NAME, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH) != 0)	// If not, then create FIFO
     {
-      fprintf(stderr, "Could not create fifo: %s\n", FIFO_NAME);
+      fprintf(stderr, "Could not create FIFO: %s\n", FIFO_NAME);
       exit(EXIT_FAILURE);
     }
+  if (chmod(FIFO_NAME, S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IWOTH | S_IROTH) != 0)	// Change permissions on FIFO
+  {
+    fprintf(stderr, "Could not change permissions on FIFO: %s\n", FIFO_NAME);
+    exit(EXIT_FAILURE);
+  }
   readfd = open(FIFO_NAME, O_RDONLY | O_NONBLOCK);	// Open FIFO in read-only, non-blocking mode
-  fcntl(readfd, F_SETOWN, getpid());				// Connect the FIFO to this programs PID
-  fcntl(readfd, F_SETFL, O_ASYNC);					// Set the O_ASYNC on the FIFO
-  signal(SIGIO, fifo_reader);						// Register our handler of SIGIO
+  fcntl(readfd, F_SETOWN, getpid());			// Connect the FIFO to this programs PID
+  fcntl(readfd, F_SETFL, O_ASYNC);			// Set the O_ASYNC on the FIFO
+  signal(SIGIO, fifo_reader);				// Register our handler of SIGIO
 
   init_arrays();
 
