@@ -11,14 +11,14 @@
 #include <time.h>				// Need this for time in logs
 #include <fcntl.h>				// Need this for named pipes
 #include <signal.h>				// Need this for catching SIGIO
-#include <wiringPi.h>				// WiringPi GPIO library
+#include <pigpio.h>				// PiGPIO C library
 #include <mysql/mysql.h>			// MySQL library
 
 #include <sys/ioctl.h>				// For SPI comms
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "ver 0.8.8-next"		// Program version
+#define PROG_VER "ver 0.8.8-next-pigpio"	// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
@@ -88,7 +88,7 @@ void init_arrays(void);
 
 uint8_t get_sample(uint8_t, uint8_t);
 
-void myInterrupt(void);
+void myInterrupt(int, int, uint32_t);
 
 void finish_with_error(MYSQL *conn);
 
@@ -103,11 +103,13 @@ int main(void)
   fprintf(stderr, "Initialize error log. SPI_LOGGER %s\n",PROG_VER);
 
   // Initialize GPIO
-  wiringPiSetupGpio();
-  pinMode(RESET_PIN, OUTPUT);
-  digitalWrite(RESET_PIN, HIGH);
-  pinMode(DHW_PIN, OUTPUT);
-  digitalWrite(DHW_PIN, LOW);
+  gpioInitialise();
+  gpioSetMode(RESET_PIN, PI_OUTPUT);
+  gpioWrite(RESET_PIN, PI_HIGH);
+  gpioSetMode(INT_PIN, PI_INPUT);
+  gpioSetPullUpDown(INT_PIN, PI_PUD_OFF);
+  gpioSetMode(DHW_PIN, PI_OUTPUT);
+  gpioWrite(DHW_PIN, PI_LOW);
 
   // Initialize SPI communication
   spihandle = open(device, O_RDWR);
@@ -135,14 +137,14 @@ int main(void)
   init_arrays();
 
   // Check if a sample is available before initializing interrupt and wait loop
-  if (digitalRead(INT_PIN) == 1)
+  if (gpioRead(INT_PIN) == 1)
   {
     fprintf(stderr, "MAIN: INT_PIN active during setup, calling ISR\n");
-    myInterrupt();
+    myInterrupt(0,0,0);
   }
 
   // Initialize interrupt handling procedure
-  if (wiringPiISR(INT_PIN, INT_EDGE_RISING, &myInterrupt) < 0)
+  if (gpioSetISRFunc(INT_PIN, RISING_EDGE, 0, myInterrupt) < 0)
   {
     perror("Unable to register ISR");
     free(datalog);
@@ -174,9 +176,9 @@ int main(void)
 	if (dhw)
 	  if ((time_3 - dhw_start) > 180)	// If 180 seconds have passed since we started DHW production
 	  {
-		digitalWrite(DHW_PIN, LOW);
+		gpioWrite(DHW_PIN, PI_LOW);
 		dhw = 0;
-	    set_temp(60);
+	    	set_temp(60);
 		fprintf(stderr, "DHW stop\n");
 	  }
 
@@ -189,9 +191,9 @@ int main(void)
         {
 	      debug_msg();
 	      fprintf(stderr, "SPI connection has not been in use for last 140 seconds, reset AVR!\n");
-	      digitalWrite(RESET_PIN, LOW);
+	      gpioWrite(RESET_PIN, PI_LOW);
 	      sleep(1);
-	      digitalWrite(RESET_PIN, HIGH);
+	      gpioWrite(RESET_PIN, PI_HIGH);
 	      error_count = 0;
         }
     }
@@ -261,7 +263,7 @@ void fifo_reader(int signum)
 		    break;
 
 		  case 0xB3:
-		  	digitalWrite(DHW_PIN, HIGH);
+		  	gpioWrite(DHW_PIN, PI_HIGH);
 		  	fprintf(stderr, "DHW start\n");
 			dhw = 1;
 			set_temp(30);
@@ -425,10 +427,10 @@ void debug_msg(void)
 
 int trySPIcon(void)
 {
-  if (digitalRead(INT_PIN) == 1)				// Check if we somehow missed the interrupt
+  if (gpioRead(INT_PIN) == 1)				// Check if we somehow missed the interrupt
   {
     fprintf(stderr, "TrySPI: Somehow we have missed the interrupt, execute NOW!\n");
-    myInterrupt();
+    myInterrupt(0,0,0);
     error_count = 0;
     return 1;
   }
@@ -446,7 +448,7 @@ int trySPIcon(void)
     // Check SPI transmission
     tx_buffer = 0xF2;							// Load with F2 to request TWI RESET
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command, probably 0xAF if previous sample was OK
-	usleep(1);									// Short delay to allow AVR to catch up
+    usleep(1);									// Short delay to allow AVR to catch up
     tx_buffer = 0xFF;							// Load with FF to send PING
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
     switch(rx_buffer)
@@ -647,8 +649,11 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
   return 1;
 }
 
-void myInterrupt(void)
+void myInterrupt(int gpio, int level, uint32_t tick)
 {
+//  if (dbg)
+    fprintf(stderr, "ISR: GPIO:%i LEVEL:%i TICK:%u\n", gpio, level, tick);
+
   tick_2 = clock();		// Get current tick
   tick_3 = tick_2 - tick_1;	// Calculate how many ticks have elapsed since last time
 
@@ -660,7 +665,7 @@ void myInterrupt(void)
   }
 
   // Check if the signal pin is high, if not something is wrong...
-  if (digitalRead(INT_PIN) == 0)
+  if (gpioRead(INT_PIN) == 0)
   {
     fprintf(stderr, "ISR: Interrupt pin is not active!\n");
     fprintf(stderr, "ISR: Tick_3: %ld\n", tick_3);
