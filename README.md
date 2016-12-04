@@ -21,12 +21,12 @@ B2        : Toggle DEBUG mode
 
 B3        : Start DHW heating cycle
 
-DC xx     : Set room_temp to xx/2
+DC xx     : Set room_temp to xx(HEX) / 2
 
 DD 14     : Reset all alarms
 
-DE xx     : Set number of SMS to xx
+DE xx     : Set number of SMS to xx (01-63 HEX) 00 and >63 = Modem OK NO
 
-F2 xx     : Set hot water temp to xx (25-99)
+F2 xx     : Set hot water temp to xx (25-99 DEC)
 
 F3 xx yy  : Send commmand xx and argument yy to digipot
