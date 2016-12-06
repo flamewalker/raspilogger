@@ -18,13 +18,19 @@
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "ver 0.8.8-next"		// Program version
+#define PROG_VER "ver 0.8.8-next.8"		// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
 #define FIFO_NAME "./ctc_cmd"			// The named pipe
 #define CONF_NAME "./mysql.cnf"			// The configuration file for MySQL
 #define SAMPLE_TEMPLATE "./sample_template.dat"	// The sample template file
+#define INT_TICK_1 100				// Threshold for error reporting of interrupt errors
+#define INT_TICK_2 150				// Threshold for error reporting of interrupt errors
+#define INT_TICK_3 200				// Threshold for error reporting of interrupt errors
+#define INT_TICK_4 250				// Threshold for error reporting of interrupt errors
+#define INT_TICK_5 300				// Threshold for error reporting of interrupt errors
+#define ERROR_RATIO 0.1				// Threshold for error reporting of I2C errors
 
 // SPIDEV variables
 static const char *device = "/dev/spidev1.0";
@@ -62,6 +68,7 @@ clock_t tick_1, tick_2, tick_3;
 uint8_t dhw = 0;
 
 // Debug var
+uint16_t not_active_count_1, not_active_count_2, not_active_count_3, not_active_count_4, not_active_count_5 = 0;
 uint8_t dbg = 0;
 uint8_t duplicate_count, test4 = 0;
 float err_ratio = 0.0;
@@ -108,6 +115,8 @@ int main(void)
   digitalWrite(RESET_PIN, HIGH);
   pinMode(DHW_PIN, OUTPUT);
   digitalWrite(DHW_PIN, LOW);
+  pinMode(INT_PIN, INPUT);
+  pullUpDnControl(INT_PIN, PUD_OFF);
 
   // Initialize SPI communication
   spihandle = open(device, O_RDWR);
@@ -116,8 +125,8 @@ int main(void)
   ioctl (spihandle, SPI_IOC_WR_MODE, &mode);
 
   // Initialize the FIFO for commands
-  if (access(FIFO_NAME, F_OK) == -1)					// Check if FIFO already exists
-    if (mkfifo(FIFO_NAME, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH) != 0)	// If not, then create FIFO
+  if (access(FIFO_NAME, F_OK) == -1)							// Check if FIFO already exists
+    if (mkfifo(FIFO_NAME, S_IWUSR | S_IRUSR | S_IRGRP | S_IROTH) != 0)			// If not, then create FIFO
     {
       fprintf(stderr, "Could not create FIFO: %s\n", FIFO_NAME);
       exit(EXIT_FAILURE);
@@ -127,10 +136,10 @@ int main(void)
     fprintf(stderr, "Could not change permissions on FIFO: %s\n", FIFO_NAME);
     exit(EXIT_FAILURE);
   }
-  readfd = open(FIFO_NAME, O_RDONLY | O_NONBLOCK);	// Open FIFO in read-only, non-blocking mode
-  fcntl(readfd, F_SETOWN, getpid());			// Connect the FIFO to this programs PID
-  fcntl(readfd, F_SETFL, O_ASYNC);			// Set the O_ASYNC on the FIFO
-  signal(SIGIO, fifo_reader);				// Register our handler of SIGIO
+  readfd = open(FIFO_NAME, O_RDONLY | O_NONBLOCK);		// Open FIFO in read-only, non-blocking mode
+  fcntl(readfd, F_SETOWN, getpid());				// Connect the FIFO to this programs PID
+  fcntl(readfd, F_SETFL, O_ASYNC);				// Set the O_ASYNC on the FIFO
+  signal(SIGIO, fifo_reader);					// Register our handler of SIGIO
 
   init_arrays();
 
@@ -251,16 +260,21 @@ void fifo_reader(int signum)
             fprintf(stderr, "Debug_msg, tot_error=: %u\n", tot_error);
             fprintf(stderr, "Debug_msg, tot_samples=: %u\n", tot_samples);
             fprintf(stderr, "Debug_msg, secs=: %.2f\n", secs);
+            fprintf(stderr, "Debug_msg, not_active_count_1=: %u\n", not_active_count_1);
+            fprintf(stderr, "Debug_msg, not_active_count_2=: %u\n", not_active_count_2);
+            fprintf(stderr, "Debug_msg, not_active_count_3=: %u\n", not_active_count_3);
+            fprintf(stderr, "Debug_msg, not_active_count_4=: %u\n", not_active_count_4);
+            fprintf(stderr, "Debug_msg, not_active_count_5=: %u\n", not_active_count_5);
             break;
 
-		  case 0xB2:
-		  	dbg = !dbg;
+          case 0xB2:
+            dbg = !dbg;
             fprintf(stderr, "DEBUG MODE: %u\n", dbg);
             if (dbg)
               debug_msg();
 		    break;
 
-		  case 0xB3:
+	  case 0xB3:
 		  	digitalWrite(DHW_PIN, HIGH);
 		  	fprintf(stderr, "DHW start\n");
 			dhw = 1;
@@ -297,13 +311,13 @@ void fifo_reader(int signum)
             sscanf(str, "%x%u", &cmd, &arg);
             set_temp(arg);
           }
-		  else
-		  {
-		    fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
-			fprintf(stderr, "FIFO_READ: Cmd: %x\tArg: %u\n", cmd, arg);
-		  }
+	  else
+	  {
+	    fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
+	    fprintf(stderr, "FIFO_READ: Cmd: %x\tArg: %u\n", cmd, arg);
+	  }
         }
-		break;
+	break;
 
       default:		// possibly command, argument and data (HEX UINT UINT)
         sscanf(str, "%x%u%u", &cmd, &arg, &data);
@@ -662,10 +676,22 @@ void myInterrupt(void)
   // Check if the signal pin is high, if not something is wrong...
   if (digitalRead(INT_PIN) == 0)
   {
-    fprintf(stderr, "ISR: Interrupt pin is not active!\n");
-    fprintf(stderr, "ISR: Tick_3: %ld\n", tick_3);
+    if (tick_3 < INT_TICK_1)
+      not_active_count_1++;
+    if (tick_3 >= INT_TICK_1 && tick_3 < INT_TICK_2)
+      not_active_count_2++;
+    if (tick_3 >= INT_TICK_2 && tick_3 < INT_TICK_3)
+      not_active_count_3++;
+    if (tick_3 >= INT_TICK_3 && tick_3 < INT_TICK_4)
+      not_active_count_4++;
+    if (tick_3 >= INT_TICK_4)
+    {
+      not_active_count_5++;
+      fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld   Count: %u\n", tick_3, not_active_count_5);
+    }
     return;
   }
+
   // Set watchdog flag to indicate we're handling this IRQ
   int_active = 1;
 
@@ -676,6 +702,7 @@ void myInterrupt(void)
   if (rx_buffer != 0xAD && rx_buffer != 0xAF && rx_buffer != 0x01 && rx_buffer != 0xFF)
     fprintf(stderr, "ISR: Throwaway value: %02X\n", rx_buffer);
 
+  usleep(1);					// Small delay to ensure AVR acknowledges the command
   tx_buffer = 0xFE;								// Load with 0xFE to command next reply to be how many blocks to expect, if any
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
 
@@ -696,27 +723,29 @@ void myInterrupt(void)
     fprintf(stderr, "ISR: Time since sleep= %2u\n", diff_s);
   }
 
-  // Check if SAMPLE_DUMP command was acknowledged
+  // Check if SAMPLE_DUMP command was acknowledged, TODO: Rewrite routine to catch errors...
   if (rx_buffer != 0xF0)
   {
-    if (rx_buffer != 0xF0)
-      fprintf(stderr, "ISR: SAMPLE_DUMP not ack'd: %02X\n", rx_buffer);
+    fprintf(stderr, "ISR: SAMPLE_DUMP not ack'd: %02X\n", rx_buffer);
+
+    usleep(1);					// Small delay to ensure AVR acknowledges the command
     tx_buffer = 0xFF;
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Send first command and receive whatever is in the buffer
 
     if (rx_buffer != 0xFE)
       fprintf(stderr, "ISR: Expect FE: %02X\n", rx_buffer);
 
+    usleep(1);					// Small delay to ensure AVR acknowledges the command
     tx_buffer = 0xFE;							// Load with 0xFE to command next reply to be how many blocks to expect, if any
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
 
     if (rx_buffer != 0xFF)
-      fprintf(stderr, "ISR: Expect FF: %02X\n", rx_buffer);
-
-    if (rx_buffer != 0xFF)
     {
+      fprintf(stderr, "ISR: Expect FF: %02X\n", rx_buffer);
       fprintf(stderr, "ISR: Sample collection returned error: %02X\n", rx_buffer);
       int_active = 0;
+
+      usleep(1);					// Small delay to ensure AVR acknowledges the command
       tx_buffer = 0xF0;
       spiTxRx(spihandle, &tx_buffer, &rx_buffer);
       return;
@@ -727,6 +756,7 @@ void myInterrupt(void)
   uint8_t x,y;
 
   // Check how many blocks to expect from AVR
+  usleep(1);					// Small delay to ensure AVR acknowledges the command
   tx_buffer = 0xFF;				// Send as NO-OP / PING
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
@@ -735,7 +765,7 @@ void myInterrupt(void)
   // Execute right amount of loops to receive correct number of blocks from AVR
   if (sample_sent & 1)			// SYSTIME block (Area 2)
   {
-	sample_sent |= 130;			// If SYSTIME has changed, make sure we get a CURRENT and ONEWIRE sample also
+    sample_sent |= 130;			// If SYSTIME has changed, make sure we get a CURRENT and ONEWIRE sample also
     if(!get_sample(settings, systime))
       return;
   }
@@ -761,59 +791,66 @@ void myInterrupt(void)
     if(!get_sample(status, temperature))
       return;
 
-  tx_buffer = 0xF0;				// Signal end of sample sending
-  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
   usleep(1);					// Small delay to ensure AVR acknowledges the command
+  tx_buffer = 0xF0;				// Send 0xF0 to command an end to SAMPLE_DUMP
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
   // Debug code
-  tx_buffer = 0xA1;						// Load with A1 to request test2 which contains TWI error code
-  spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
+  usleep(1);					// Small delay to ensure AVR acknowledges the command
+  tx_buffer = 0xA1;				// Load with A1 to request test2 which contains TWI error code
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
   test4 = rx_buffer;
   tot_samples = tot_samples + test4;
-  if (test4 > 0)
-    if (secs > 0)
-      secs = (secs + (float)diff_i/test4) / 2;			// Calculate how many seconds in average between samples
-    else
-    {
-      secs = (float)diff_i/test4;				// Set a baseline value for further calculations
-      fprintf(stderr, "ISR: Secs= %.2f\n", secs);
-    }
+  if (sample_sent != 128)			// Calculate time only between TWI samples
+  {
+    if (test4 > 0)
+      if (secs > 0)
+        secs = (secs + (float)diff_i/test4)/2;	// Calculate how many seconds in average between samples
+      else
+      {
+        secs = (float)diff_i/test4;		// Set a baseline value for further calculations
+        fprintf(stderr, "ISR: Secs= %.2f\n", secs);
+      }
+  }
   if (dbg)
     fprintf(stderr, "ISR: Seconds between= %.2f\n", (float)diff_i/test4);
 
-  tx_buffer = 0xFF;						// Load with FF to PING
-  spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
+  usleep(1);					// Small delay to ensure AVR acknowledges the command
+  tx_buffer = 0xFF;				// Load with FF to PING
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
   if (rx_buffer == 0xA1)
   {
-    usleep(1);								// Short delay to allow AVR to catch up
+    usleep(1);					// Short delay to allow AVR to catch up
     tx_buffer = 0xA1;
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
-    usleep(1);								// Short delay to allow AVR to catch up
-    tx_buffer = 0xFF;						// Load with FF to PING
-    spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
+    usleep(1);					// Short delay to allow AVR to catch up
+    tx_buffer = 0xFF;				// Load with FF to PING
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
   }
-  if (rx_buffer > 0 && rx_buffer != 64)				// Buffer contains test2, if test2 > 0, then an error has occured
+  if (rx_buffer > 0 && rx_buffer != 64)		// Buffer contains test2, if test2 > 0, then an error has occured
   {
     fprintf(stderr, "ISR: test2 check= %2u\n", rx_buffer);
     debug_msg();
   }
   if (rx_buffer & 64)
   {
-    tx_buffer = 0xA0;						// Load with A0 to request test1 (# of TWI bus error due to illegal START or STOP condition)
+    usleep(1);					// Small delay to ensure AVR acknowledges the command
+    tx_buffer = 0xA0;				// Load with A0 to request test1 (# of TWI bus error due to illegal START or STOP condition)
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
-    usleep(1);								// Short delay to allow AVR to catch up
+    usleep(1);					// Short delay to allow AVR to catch up
     tx_buffer = 0xFF;
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
     if (tot_samples > 0)
     {
       tot_error = tot_error + rx_buffer;
       err_ratio = (float)tot_error / (float)tot_samples * 100.0;
-      if (err_ratio > 0.1500)
+      if (err_ratio > ERROR_RATIO)
         fprintf(stderr, "ISR: Err_ratio= %.4f%\ttot_error= %u\ttot_samples= %u\n", err_ratio, tot_error, tot_samples);
     }
   }
 
-  tx_buffer = 0xAF;							// Load with AF to end the SAMPLE_DUMP
+  usleep(1);					// Small delay to ensure AVR acknowledges the command
+  tx_buffer = 0xAF;				// Send 0xAF to reset the debug vars
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
   // If needed, write downloaded array to files complete with SQL
