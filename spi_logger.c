@@ -18,7 +18,7 @@
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "ver 0.8.8-next.8"		// Program version
+#define PROG_VER "ver 0.8.8-next.10"		// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
@@ -70,9 +70,9 @@ uint8_t dhw = 0;
 // Debug var
 uint16_t not_active_count_1, not_active_count_2, not_active_count_3, not_active_count_4, not_active_count_5 = 0;
 uint8_t dbg = 0;
-uint8_t duplicate_count, test4 = 0;
+uint8_t duplicate_count, test4, test5 = 0;
 float err_ratio = 0.0;
-uint32_t tot_samples = 0;
+uint32_t tot_twi_samples, tot_ow_samples = 0;
 uint32_t tot_error = 0;
 float secs = 0.0;
 
@@ -255,10 +255,11 @@ void fifo_reader(int signum)
             break;
 
           case 0xB1:
-            err_ratio = (float)tot_error / (float)tot_samples * 100.0;
+            err_ratio = (float)tot_error / (float)tot_twi_samples * 100.0;
             fprintf(stderr, "Debug_msg, err_ratio=: %.4f%\n", err_ratio);
             fprintf(stderr, "Debug_msg, tot_error=: %u\n", tot_error);
-            fprintf(stderr, "Debug_msg, tot_samples=: %u\n", tot_samples);
+            fprintf(stderr, "Debug_msg, tot_twi_samples=: %u\n", tot_twi_samples);
+            fprintf(stderr, "Debug_msg, tot_ow_samples=: %u\n", tot_ow_samples);
             fprintf(stderr, "Debug_msg, secs=: %.2f\n", secs);
             fprintf(stderr, "Debug_msg, not_active_count_1=: %u\n", not_active_count_1);
             fprintf(stderr, "Debug_msg, not_active_count_2=: %u\n", not_active_count_2);
@@ -432,7 +433,8 @@ void debug_msg(void)
   tx_buffer = 0xFF;												// Load with FF to send NO-OP/PING
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
   fprintf(stderr, "Debug_msg, slask_tx2=: %02X\n", rx_buffer);
-  fprintf(stderr, "Debug_msg, samples=: %u\n",test4);
+  fprintf(stderr, "Debug_msg, twi_samples=: %u\n",test4);
+  fprintf(stderr, "Debug_msg, ow_samples=: %u\n",test5);
   fprintf(stderr, "Debug_msg, duplicate_count=: %u\n",duplicate_count);
   fprintf(stderr, "------------------------------------------\n");
 }
@@ -710,19 +712,6 @@ void myInterrupt(void)
   conn_alive = 1;
   error_count = 0;
 
-  // Set time vars
-  time_1 = time(NULL);		// Get current time
-  diff_i = time_1 - time_2;	// Time since we last were here, i.e. between interrupts
-  diff_s = time_1 - time_3;	// Time since we started a new 70 sec waiting period
-  time_2 = time_1;			// Set time to now
-
-  // Debug code
-  if (dbg)
-  {
-    fprintf(stderr, "ISR: Time since last = %2u\n", diff_i);
-    fprintf(stderr, "ISR: Time since sleep= %2u\n", diff_s);
-  }
-
   // Check if SAMPLE_DUMP command was acknowledged, TODO: Rewrite routine to catch errors...
   if (rx_buffer != 0xF0)
   {
@@ -792,17 +781,27 @@ void myInterrupt(void)
       return;
 
   usleep(1);					// Small delay to ensure AVR acknowledges the command
-  tx_buffer = 0xF0;				// Send 0xF0 to command an end to SAMPLE_DUMP
+  if (sample_sent != 128)			// Check which end command we should send
+    tx_buffer = 0xF1;				// Send 0xF1 to command an end to ow_sample_send
+  else
+    tx_buffer = 0xF0;				// Send 0xF0 to command an end to twi_sample_send
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
   // Debug code
   usleep(1);					// Small delay to ensure AVR acknowledges the command
   tx_buffer = 0xA1;				// Load with A1 to request test2 which contains TWI error code
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
-  test4 = rx_buffer;
-  tot_samples = tot_samples + test4;
-  if (sample_sent != 128)			// Calculate time only between TWI samples
+
+  if (sample_sent != 128)
   {
+    // Set time vars
+    time_1 = time(NULL);		// Get current time
+    diff_i = time_1 - time_2;		// Time since we last were here, i.e. between interrupts
+    diff_s = time_1 - time_3;		// Time since we started a new 70 sec waiting period
+    time_2 = time_1;			// Set time to now
+
+    test4 = rx_buffer;
+    tot_twi_samples += test4;
     if (test4 > 0)
       if (secs > 0)
         secs = (secs + (float)diff_i/test4)/2;	// Calculate how many seconds in average between samples
@@ -811,9 +810,20 @@ void myInterrupt(void)
         secs = (float)diff_i/test4;		// Set a baseline value for further calculations
         fprintf(stderr, "ISR: Secs= %.2f\n", secs);
       }
+
+    // Debug code
+    if (dbg)
+    {
+      fprintf(stderr, "ISR: Time since last = %2u\n", diff_i);
+      fprintf(stderr, "ISR: Time since sleep= %2u\n", diff_s);
+      fprintf(stderr, "ISR: Seconds between= %.2f\n", (float)diff_i/test4);
+    }
   }
-  if (dbg)
-    fprintf(stderr, "ISR: Seconds between= %.2f\n", (float)diff_i/test4);
+  else
+  {
+    test5 = rx_buffer;
+    tot_ow_samples += test5;
+  }
 
   usleep(1);					// Small delay to ensure AVR acknowledges the command
   tx_buffer = 0xFF;				// Load with FF to PING
@@ -840,12 +850,12 @@ void myInterrupt(void)
     usleep(1);					// Short delay to allow AVR to catch up
     tx_buffer = 0xFF;
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);
-    if (tot_samples > 0)
+    if (tot_twi_samples > 0)
     {
-      tot_error = tot_error + rx_buffer;
-      err_ratio = (float)tot_error / (float)tot_samples * 100.0;
+      tot_error += rx_buffer;
+      err_ratio = (float)tot_error / (float)tot_twi_samples * 100.0;
       if (err_ratio > ERROR_RATIO)
-        fprintf(stderr, "ISR: Err_ratio= %.4f%\ttot_error= %u\ttot_samples= %u\n", err_ratio, tot_error, tot_samples);
+        fprintf(stderr, "ISR: Err_ratio= %.4f%\ttot_error= %u\ttot_twi_samples= %u\n", err_ratio, tot_error, tot_twi_samples);
     }
   }
 
