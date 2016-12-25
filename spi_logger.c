@@ -18,18 +18,18 @@
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "ver 0.8.8-next.10"		// Program version
+#define PROG_VER "ver 0.8.8-next.11"		// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
 #define FIFO_NAME "./ctc_cmd"			// The named pipe
 #define CONF_NAME "./mysql.cnf"			// The configuration file for MySQL
 #define SAMPLE_TEMPLATE "./sample_template.dat"	// The sample template file
-#define INT_TICK_1 100				// Threshold for error reporting of interrupt errors
+#define INT_TICK_1 125				// Threshold for error reporting of interrupt errors
 #define INT_TICK_2 150				// Threshold for error reporting of interrupt errors
-#define INT_TICK_3 200				// Threshold for error reporting of interrupt errors
-#define INT_TICK_4 250				// Threshold for error reporting of interrupt errors
-#define INT_TICK_5 300				// Threshold for error reporting of interrupt errors
+#define INT_TICK_3 175				// Threshold for error reporting of interrupt errors
+#define INT_TICK_4 200				// Threshold for error reporting of interrupt errors
+#define INT_TICK_5 225				// Threshold for error reporting of interrupt errors
 #define ERROR_RATIO 0.1				// Threshold for error reporting of I2C errors
 
 // SPIDEV variables
@@ -59,9 +59,8 @@ uint8_t array_size, settings, historical, systime, current, alarms, last24h, sta
 // Handle for named pipe
 int readfd;
 
-// Time related vars
-time_t time_1, time_2, time_3, dhw_start;
-uint8_t diff_t, diff_i, diff_s;
+// Global time related vars
+time_t time_isr_last, time_start_wait_period, dhw_start;
 clock_t tick_1, tick_2, tick_3;
 
 // DHW active flag
@@ -93,7 +92,7 @@ int trySPIcon(void);
 
 void init_arrays(void);
 
-uint8_t get_sample(uint8_t, uint8_t);
+void get_sample(uint8_t, uint8_t);
 
 void myInterrupt(void);
 
@@ -166,22 +165,22 @@ int main(void)
   tick_1 = clock();
 
   // Initialize time vars
-  time_1 = time(NULL);
-  time_2 = time_1;
+  time_isr_last = time(NULL);
+  uint8_t sleep_time = 0;
 
   // Endless loop waiting for IRQ from AVR
   while (1)
   {
-    time_3 = time(NULL);
-    diff_t = time_2 + 70 - time_3;		// Calculate when 70 seconds have passed since last interrupt
+    time_start_wait_period = time(NULL);							// Get current time stamp
+    sleep_time = time_isr_last + 70 - time_start_wait_period;		// Calculate when 70 seconds have passed since last interrupt
 
     // Debug code
     if (dbg)
-      fprintf(stderr, "Debug msg, Sleep ( %u )\n", diff_t);
+      fprintf(stderr, "Debug msg, Sleep ( %u )\n", sleep_time);
 
     // DHW code
 	if (dhw)
-	  if ((time_3 - dhw_start) > 180)	// If 180 seconds have passed since we started DHW production
+	  if ((time_start_wait_period - dhw_start) > 180)	// If 180 seconds have passed since we started DHW production
 	  {
 		digitalWrite(DHW_PIN, LOW);
 		dhw = 0;
@@ -189,7 +188,7 @@ int main(void)
 		fprintf(stderr, "DHW stop\n");
 	  }
 
-    if ((sleep(diff_t)) == 0)
+    if ((sleep(sleep_time)) == 0)		// Sleep and check if we finished without interrupt?
     {
       if (conn_alive == 1)				// Check if the SPI communication has been active in the last 70 seconds
         conn_alive = 0;
@@ -451,7 +450,7 @@ int trySPIcon(void)
   else
   {
     // Set a new time for the next waiting period
-    time_2 = time(NULL);
+    time_isr_last = time(NULL);
 
     // Increase the number of times we have come here and break if more than 0
     if (error_count++ > 0)
@@ -614,7 +613,7 @@ uint8_t test_spi(uint8_t val)
     return 1;
 }
 
-uint8_t get_sample(uint8_t start, uint8_t stop)
+void get_sample(uint8_t start, uint8_t stop)
 {
   tx_buffer = sample_template[start];
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
@@ -660,7 +659,6 @@ uint8_t get_sample(uint8_t start, uint8_t stop)
     duplicate_count++;
   }
   datalog[stop-1] = rx_buffer;
-  return 1;
 }
 
 void myInterrupt(void)
@@ -678,7 +676,11 @@ void myInterrupt(void)
   // Check if the signal pin is high, if not something is wrong...
   if (digitalRead(INT_PIN) == 0)
   {
-    if (tick_3 < INT_TICK_1)
+	if (tick_3 < INT_TICK_1)
+	{
+	  fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld\n", tick_3);	
+	}
+    if (tick_3 > 99 && tick_3 < INT_TICK_1)
       not_active_count_1++;
     if (tick_3 >= INT_TICK_1 && tick_3 < INT_TICK_2)
       not_active_count_2++;
@@ -755,36 +757,28 @@ void myInterrupt(void)
   if (sample_sent & 1)			// SYSTIME block (Area 2)
   {
     sample_sent |= 130;			// If SYSTIME has changed, make sure we get a CURRENT and ONEWIRE sample also
-    if(!get_sample(settings, systime))
-      return;
+    get_sample(settings, systime);
   }
   if (sample_sent & 2)			// CURRENT block (Area 4)
-    if(!get_sample(historical, current))
-      return;
+    get_sample(historical, current);
   if (sample_sent & 4)			// HISTORICAL block (Area 3)
-    if(!get_sample(systime, historical))
-      return;
+    get_sample(systime, historical);
   if (sample_sent & 8)			// SETTINGS block (Area 1)
-    if(!get_sample(0, settings))
-      return;
+    get_sample(0, settings);
   if (sample_sent & 16)			// ALARMS block (Area 5)
-    if(!get_sample(current, alarms))
-      return;
+    get_sample(current, alarms);
   if (sample_sent & 32)			// LAST_24H block (Area 6)
-    if(!get_sample(alarms, last24h))
-      return;
+    get_sample(alarms, last24h);
   if (sample_sent & 64)			// STATUS block (Area 7)
-    if(!get_sample(last24h, status))
-      return;
+    get_sample(last24h, status);
   if (sample_sent & 128)		// ONEWIRE block (Area 8)
-    if(!get_sample(status, temperature))
-      return;
+    get_sample(status, temperature);
 
   usleep(1);					// Small delay to ensure AVR acknowledges the command
-  if (sample_sent != 128)			// Check which end command we should send
-    tx_buffer = 0xF1;				// Send 0xF1 to command an end to ow_sample_send
+  if (sample_sent != 128)		// Check which end command we should send
+    tx_buffer = 0xF1;			// Send 0xF1 to command an end to ow_sample_send
   else
-    tx_buffer = 0xF0;				// Send 0xF0 to command an end to twi_sample_send
+    tx_buffer = 0xF0;			// Send 0xF0 to command an end to twi_sample_send
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
   // Debug code
@@ -795,28 +789,28 @@ void myInterrupt(void)
   if (sample_sent != 128)
   {
     // Set time vars
-    time_1 = time(NULL);		// Get current time
-    diff_i = time_1 - time_2;		// Time since we last were here, i.e. between interrupts
-    diff_s = time_1 - time_3;		// Time since we started a new 70 sec waiting period
-    time_2 = time_1;			// Set time to now
+    time_t time_isr_now = time(NULL);										// Get current time stamp
+    uint8_t diff_isr = time_isr_now - time_isr_last;						// Calculate time between interrupts
+    uint8_t diff_wait_period = time_isr_now - time_start_wait_period;		// Calculate time since we started a new 70 sec waiting period
+    time_isr_last = time_isr_now;											// Set time to now
 
     test4 = rx_buffer;
     tot_twi_samples += test4;
     if (test4 > 0)
       if (secs > 0)
-        secs = (secs + (float)diff_i/test4)/2;	// Calculate how many seconds in average between samples
+        secs = (secs + (float)diff_isr/test4)/2;	// Calculate how many seconds in average between samples
       else
       {
-        secs = (float)diff_i/test4;		// Set a baseline value for further calculations
+        secs = (float)diff_isr/test4;		// Set a baseline value for further calculations
         fprintf(stderr, "ISR: Secs= %.2f\n", secs);
       }
 
     // Debug code
     if (dbg)
     {
-      fprintf(stderr, "ISR: Time since last = %2u\n", diff_i);
-      fprintf(stderr, "ISR: Time since sleep= %2u\n", diff_s);
-      fprintf(stderr, "ISR: Seconds between= %.2f\n", (float)diff_i/test4);
+      fprintf(stderr, "ISR: Time since last = %2u\n", diff_isr);
+      fprintf(stderr, "ISR: Time since sleep= %2u\n", diff_wait_period);
+      fprintf(stderr, "ISR: Seconds between= %.2f\n", (float)diff_isr/test4);
     }
   }
   else
