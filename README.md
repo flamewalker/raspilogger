@@ -25,7 +25,7 @@ DC xx     : Set room_temp to xx(HEX) / 2
 
 DD 14     : Reset all alarms
 
-DE xx     : Set number of SMS to xx (01-63 HEX) 00 and >63 = Modem OK NO
+DE xx     : Set number of SMS to xx (01-63 HEX) 00 = No modem line, 64 = Modem OK, >64 = Modem NO
 
 F2 xx     : Set hot water temp to xx (25-99 DEC)
 
