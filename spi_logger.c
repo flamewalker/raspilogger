@@ -18,18 +18,19 @@
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "ver 0.8.8-next.11"		// Program version
+#define PROG_VER "ver 0.8.8-next.13"		// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
 #define FIFO_NAME "./ctc_cmd"			// The named pipe
 #define CONF_NAME "./mysql.cnf"			// The configuration file for MySQL
 #define SAMPLE_TEMPLATE "./sample_template.dat"	// The sample template file
-#define INT_TICK_1 125				// Threshold for error reporting of interrupt errors
-#define INT_TICK_2 150				// Threshold for error reporting of interrupt errors
-#define INT_TICK_3 175				// Threshold for error reporting of interrupt errors
-#define INT_TICK_4 200				// Threshold for error reporting of interrupt errors
-#define INT_TICK_5 225				// Threshold for error reporting of interrupt errors
+#define INT_TICK_1 100				// Threshold for error reporting of interrupt errors
+#define INT_TICK_2 125				// Threshold for error reporting of interrupt errors
+#define INT_TICK_3 150				// Threshold for error reporting of interrupt errors
+#define INT_TICK_4 175				// Threshold for error reporting of interrupt errors
+#define INT_TICK_5 200				// Threshold for error reporting of interrupt errors
+#define INT_TICK_6 225				// Threshold for error reporting of interrupt errors
 #define ERROR_RATIO 0.1				// Threshold for error reporting of I2C errors
 
 // SPIDEV variables
@@ -67,7 +68,7 @@ clock_t tick_1, tick_2, tick_3;
 uint8_t dhw = 0;
 
 // Debug var
-uint16_t not_active_count_1, not_active_count_2, not_active_count_3, not_active_count_4, not_active_count_5 = 0;
+uint8_t not_active_count[7];
 uint8_t dbg = 0;
 uint8_t duplicate_count, test4, test5 = 0;
 float err_ratio = 0.0;
@@ -76,6 +77,8 @@ uint32_t tot_error = 0;
 float secs = 0.0;
 
 // Function declarations
+void fetch_avr_ver(void);
+
 int spiTxRx(int fd, uint8_t *txDat, uint8_t *rxDat);
 
 void fifo_reader(int);
@@ -141,6 +144,8 @@ int main(void)
   signal(SIGIO, fifo_reader);					// Register our handler of SIGIO
 
   init_arrays();
+
+  fetch_avr_ver();
 
   // Check if a sample is available before initializing interrupt and wait loop
   if (digitalRead(INT_PIN) == 1)
@@ -214,6 +219,21 @@ int main(void)
   exit(EXIT_FAILURE);
 }
 
+void fetch_avr_ver(void)
+{
+  tx_buffer = 0xF4;					// Load with cmd to request version numbers
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Send first command and receive whatever is in the buffer
+  tx_buffer = 0xFF;					// Load with NO-OP just to receive next number
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Send first command and receive first number
+  fprintf(stderr, "Avrlogger version: %d", rx_buffer);	// Print major version
+  tx_buffer = 0xFF;					// Load with NO-OP just to receive next number
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Send first command and receive second number
+  fprintf(stderr, ".%d", rx_buffer);			// Print minor version
+  tx_buffer = 0xFF;					// Load with NO-OP just to receive next number
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Send first command and receive third number
+  fprintf(stderr, ".%d\n", rx_buffer);			// Print build version
+}
+
 int spiTxRx(int fd, uint8_t *txDat, uint8_t *rxDat)
 {
   int ret;
@@ -260,11 +280,13 @@ void fifo_reader(int signum)
             fprintf(stderr, "Debug_msg, tot_twi_samples=: %u\n", tot_twi_samples);
             fprintf(stderr, "Debug_msg, tot_ow_samples=: %u\n", tot_ow_samples);
             fprintf(stderr, "Debug_msg, secs=: %.2f\n", secs);
-            fprintf(stderr, "Debug_msg, not_active_count_1=: %u\n", not_active_count_1);
-            fprintf(stderr, "Debug_msg, not_active_count_2=: %u\n", not_active_count_2);
-            fprintf(stderr, "Debug_msg, not_active_count_3=: %u\n", not_active_count_3);
-            fprintf(stderr, "Debug_msg, not_active_count_4=: %u\n", not_active_count_4);
-            fprintf(stderr, "Debug_msg, not_active_count_5=: %u\n", not_active_count_5);
+            fprintf(stderr, "Debug_msg, not_active_count_1=: %u\n", not_active_count[0]);
+            fprintf(stderr, "Debug_msg, not_active_count_2=: %u\n", not_active_count[1]);
+            fprintf(stderr, "Debug_msg, not_active_count_3=: %u\n", not_active_count[2]);
+            fprintf(stderr, "Debug_msg, not_active_count_4=: %u\n", not_active_count[3]);
+            fprintf(stderr, "Debug_msg, not_active_count_5=: %u\n", not_active_count[4]);
+            fprintf(stderr, "Debug_msg, not_active_count_6=: %u\n", not_active_count[5]);
+            fprintf(stderr, "Debug_msg, not_active_count_7=: %u\n", not_active_count[6]);
             break;
 
           case 0xB2:
@@ -281,6 +303,10 @@ void fifo_reader(int signum)
 			set_temp(30);
 			dhw_start = time(NULL);
 			break;
+
+          case 0xB4:
+            fetch_avr_ver();
+            break;
 
           default:
 		    if (cmd >= 0xA0 && cmd <= 0xAF)
@@ -676,22 +702,25 @@ void myInterrupt(void)
   // Check if the signal pin is high, if not something is wrong...
   if (digitalRead(INT_PIN) == 0)
   {
-	if (tick_3 < INT_TICK_1)
-	{
-	  fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld\n", tick_3);	
-	}
-    if (tick_3 > 99 && tick_3 < INT_TICK_1)
-      not_active_count_1++;
-    if (tick_3 >= INT_TICK_1 && tick_3 < INT_TICK_2)
-      not_active_count_2++;
-    if (tick_3 >= INT_TICK_2 && tick_3 < INT_TICK_3)
-      not_active_count_3++;
-    if (tick_3 >= INT_TICK_3 && tick_3 < INT_TICK_4)
-      not_active_count_4++;
-    if (tick_3 >= INT_TICK_4)
+    if (tick_3 < INT_TICK_1)
     {
-      not_active_count_5++;
-      fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld   Count: %u\n", tick_3, not_active_count_5);
+      fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld\n", tick_3);
+      not_active_count[0]++;
+    }
+    if (tick_3 >= INT_TICK_1 && tick_3 < INT_TICK_2)
+      not_active_count[1]++;
+    if (tick_3 >= INT_TICK_2 && tick_3 < INT_TICK_3)
+      not_active_count[2]++;
+    if (tick_3 >= INT_TICK_3 && tick_3 < INT_TICK_4)
+      not_active_count[3]++;
+    if (tick_3 >= INT_TICK_4 && tick_3 < INT_TICK_5)
+      not_active_count[4]++;
+    if (tick_3 >= INT_TICK_5 && tick_3 < INT_TICK_6)
+      not_active_count[5]++;
+    if (tick_3 >= INT_TICK_6)
+    {
+      not_active_count[6]++;
+      fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld   Count: %u\n", tick_3, not_active_count[6]);
     }
     return;
   }
