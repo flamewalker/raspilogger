@@ -112,7 +112,7 @@ int main(void)
 
   // Greeting message to signal we're alive
   fprintf(stderr, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
-  fprintf(stderr, "RASPI_LOGGER version: %s\n",PROG_VER);
+  fprintf(stderr, "SPI_LOGGER version: %s\n",PROG_VER);
 
   // Initialize GPIO
   wiringPiSetupGpio();
@@ -148,6 +148,7 @@ int main(void)
 
   init_arrays();
 
+  sleep(2);		// Small pause in order for AVR to finish startup
   fetch_avr_ver();
 
   // Check if a sample is available before initializing interrupt and wait loop
