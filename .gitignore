@@ -1,6 +1,9 @@
 # Object files
 *.o
 
+# Config files
+*.cnf
+
 # Executable
 spi_logger
 
