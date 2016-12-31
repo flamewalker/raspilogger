@@ -18,20 +18,32 @@
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "ver 0.8.8-next.13"		// Program version
+#define PROG_VER "0.8.8-next.14"		// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
 #define FIFO_NAME "./ctc_cmd"			// The named pipe
 #define CONF_NAME "./mysql.cnf"			// The configuration file for MySQL
 #define SAMPLE_TEMPLATE "./sample_template.dat"	// The sample template file
+
 #define INT_TICK_1 100				// Threshold for error reporting of interrupt errors
 #define INT_TICK_2 125				// Threshold for error reporting of interrupt errors
 #define INT_TICK_3 150				// Threshold for error reporting of interrupt errors
 #define INT_TICK_4 175				// Threshold for error reporting of interrupt errors
 #define INT_TICK_5 200				// Threshold for error reporting of interrupt errors
 #define INT_TICK_6 225				// Threshold for error reporting of interrupt errors
+#define INT_TICK_7 250				// Threshold for error reporting of interrupt errors
+
 #define ERROR_RATIO 0.1				// Threshold for error reporting of I2C errors
+
+// Debug var
+uint8_t not_active_count[8];
+uint8_t dbg = 0;
+uint8_t duplicate_count, test4, test5 = 0;
+float err_ratio = 0.0;
+uint32_t tot_twi_samples, tot_ow_samples = 0;
+uint32_t tot_error = 0;
+float secs = 0.0;
 
 // SPIDEV variables
 static const char *device = "/dev/spidev1.0";
@@ -67,15 +79,6 @@ clock_t tick_1, tick_2, tick_3;
 // DHW active flag
 uint8_t dhw = 0;
 
-// Debug var
-uint8_t not_active_count[7];
-uint8_t dbg = 0;
-uint8_t duplicate_count, test4, test5 = 0;
-float err_ratio = 0.0;
-uint32_t tot_twi_samples, tot_ow_samples = 0;
-uint32_t tot_error = 0;
-float secs = 0.0;
-
 // Function declarations
 void fetch_avr_ver(void);
 
@@ -109,7 +112,7 @@ int main(void)
 
   // Greeting message to signal we're alive
   fprintf(stderr, "Raspberry Pi SPI Master interface to AVR CTC-logger\n");
-  fprintf(stderr, "Initialize error log. SPI_LOGGER %s\n",PROG_VER);
+  fprintf(stderr, "RASPI_LOGGER version: %s\n",PROG_VER);
 
   // Initialize GPIO
   wiringPiSetupGpio();
@@ -225,7 +228,7 @@ void fetch_avr_ver(void)
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Send first command and receive whatever is in the buffer
   tx_buffer = 0xFF;					// Load with NO-OP just to receive next number
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Send first command and receive first number
-  fprintf(stderr, "Avrlogger version: %d", rx_buffer);	// Print major version
+  fprintf(stderr, "AVR_LOGGER version: %d", rx_buffer);	// Print major version
   tx_buffer = 0xFF;					// Load with NO-OP just to receive next number
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Send first command and receive second number
   fprintf(stderr, ".%d", rx_buffer);			// Print minor version
@@ -287,6 +290,7 @@ void fifo_reader(int signum)
             fprintf(stderr, "Debug_msg, not_active_count_5=: %u\n", not_active_count[4]);
             fprintf(stderr, "Debug_msg, not_active_count_6=: %u\n", not_active_count[5]);
             fprintf(stderr, "Debug_msg, not_active_count_7=: %u\n", not_active_count[6]);
+            fprintf(stderr, "Debug_msg, not_active_count_8=: %u\n", not_active_count[7]);
             break;
 
           case 0xB2:
@@ -703,10 +707,7 @@ void myInterrupt(void)
   if (digitalRead(INT_PIN) == 0)
   {
     if (tick_3 < INT_TICK_1)
-    {
-      fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld\n", tick_3);
       not_active_count[0]++;
-    }
     if (tick_3 >= INT_TICK_1 && tick_3 < INT_TICK_2)
       not_active_count[1]++;
     if (tick_3 >= INT_TICK_2 && tick_3 < INT_TICK_3)
@@ -717,11 +718,10 @@ void myInterrupt(void)
       not_active_count[4]++;
     if (tick_3 >= INT_TICK_5 && tick_3 < INT_TICK_6)
       not_active_count[5]++;
-    if (tick_3 >= INT_TICK_6)
-    {
+    if (tick_3 >= INT_TICK_6 && tick_3 < INT_TICK_7)
       not_active_count[6]++;
-      fprintf(stderr, "ISR: Interrupt pin is not active!   Tick_3: %ld   Count: %u\n", tick_3, not_active_count[6]);
-    }
+    if (tick_3 >= INT_TICK_7)
+      not_active_count[7]++;
     return;
   }
 
@@ -732,11 +732,11 @@ void myInterrupt(void)
   tx_buffer = 0xF0;
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Send first command and recieve whatever is in the buffer
 
-  if (rx_buffer != 0xAD && rx_buffer != 0xAF && rx_buffer != 0x01 && rx_buffer != 0xFF)
+  if (dbg)
     fprintf(stderr, "ISR: Throwaway value: %02X\n", rx_buffer);
 
   usleep(1);					// Small delay to ensure AVR acknowledges the command
-  tx_buffer = 0xFE;								// Load with 0xFE to command next reply to be how many blocks to expect, if any
+  tx_buffer = 0xFE;				// Load with 0xFE to command next reply to be how many blocks to expect, if any
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
 
   // Reset watchdog flags for SPI connection alive
@@ -831,7 +831,7 @@ void myInterrupt(void)
       else
       {
         secs = (float)diff_isr/test4;		// Set a baseline value for further calculations
-        fprintf(stderr, "ISR: Secs= %.2f\n", secs);
+//        fprintf(stderr, "ISR: Secs= %.2f\n", secs);
       }
 
     // Debug code
@@ -877,7 +877,7 @@ void myInterrupt(void)
     {
       tot_error += rx_buffer;
       err_ratio = (float)tot_error / (float)tot_twi_samples * 100.0;
-      if (err_ratio > ERROR_RATIO)
+      if (err_ratio > ERROR_RATIO && tot_twi_samples >= 10000)
         fprintf(stderr, "ISR: Err_ratio= %.4f%\ttot_error= %u\ttot_twi_samples= %u\n", err_ratio, tot_error, tot_twi_samples);
     }
   }
