@@ -1,4 +1,11 @@
+# Object files
 *.o
-spi_logger
-ctc_cmd
+
+# Config files
 *.cnf
+
+# Executable
+spi_logger
+
+# Named pipe
+ctc_cmd
