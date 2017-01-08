@@ -2,7 +2,7 @@
 *.o
 
 # Config files
-*.cnf
+mysql.cnf
 
 # Executable
 spi_logger
