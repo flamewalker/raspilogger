@@ -1,6 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
- * ver 1.0.0
+ * ver 1.1.6
  */
 
 #include <stdlib.h>
@@ -18,7 +18,7 @@
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "1.0.0"			// Program version
+#define PROG_VER "1.1.6"			// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
@@ -39,7 +39,8 @@
 // Debug var
 uint8_t not_active_count[8];
 uint8_t dbg = 0;
-uint8_t duplicate_count, test4, test5 = 0;
+uint8_t duplicate_count, test4 = 0;
+uint16_t test5 = 0;
 float err_ratio = 0.0;
 uint32_t tot_twi_samples, tot_ow_samples = 0;
 uint32_t tot_error = 0;
@@ -781,13 +782,13 @@ void myInterrupt(void)
   tx_buffer = 0xFF;				// Send as NO-OP / PING
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
-  int sample_sent = rx_buffer;
+  uint8_t sample_sent = rx_buffer;
 
   // Execute right amount of loops to receive correct number of blocks from AVR
   if (sample_sent & 1)			// SYSTIME block (Area 2)
   {
     sample_sent |= 130;			// If SYSTIME has changed, make sure we get a CURRENT and ONEWIRE sample also
-    get_sample(settings, systime);
+    get_sample(settings, systime);	// Normal this only happen once every minute
   }
   if (sample_sent & 2)			// CURRENT block (Area 4)
     get_sample(historical, current);
@@ -804,28 +805,31 @@ void myInterrupt(void)
   if (sample_sent & 128)		// ONEWIRE block (Area 8)
     get_sample(status, temperature);
 
-  usleep(1);					// Small delay to ensure AVR acknowledges the command
+  usleep(1);				// Small delay to ensure AVR acknowledges the command
   if (sample_sent != 128)		// Check which end command we should send
-    tx_buffer = 0xF1;			// Send 0xF1 to command an end to ow_sample_send
+    tx_buffer = 0xF1;			// Send 0xF1 to command an end to twi_sample_send
   else
-    tx_buffer = 0xF0;			// Send 0xF0 to command an end to twi_sample_send
+    tx_buffer = 0xF0;			// Send 0xF0 to command an end to ow_sample_send
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);
 
-  // Debug code
   usleep(1);					// Small delay to ensure AVR acknowledges the command
-  tx_buffer = 0xA1;				// Load with A1 to request test2 which contains TWI error code
+  tx_buffer = 0xFF;				// Load with FF to PING for either test4 or test5
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
 
   if (sample_sent != 128)
   {
     // Set time vars
-    time_t time_isr_now = time(NULL);										// Get current time stamp
-    uint8_t diff_isr = time_isr_now - time_isr_last;						// Calculate time between interrupts
-    uint8_t diff_wait_period = time_isr_now - time_start_wait_period;		// Calculate time since we started a new 70 sec waiting period
-    time_isr_last = time_isr_now;											// Set time to now
+    time_t time_isr_now = time(NULL);					// Get current time stamp
+    uint8_t diff_isr = time_isr_now - time_isr_last;			// Calculate time between interrupts
+    uint8_t diff_wait_period = time_isr_now - time_start_wait_period;	// Calculate time since we started a new 70 sec waiting period
+    time_isr_last = time_isr_now;					// Set time to now
 
     test4 = rx_buffer;
     tot_twi_samples += test4;
+
+    if (dbg)
+      fprintf(stderr, "ISR: test4 = %u\n", rx_buffer);
+
     if (test4 > 0)
       if (secs > 0)
         secs = (secs + (float)diff_isr/test4)/2;	// Calculate how many seconds in average between samples
@@ -845,13 +849,27 @@ void myInterrupt(void)
   }
   else
   {
-    test5 = rx_buffer;
+    test5 = rx_buffer;					// Buffer should contain MSByte of test5
+    if (dbg)
+      fprintf(stderr, "ISR: MSByte = %u\t", rx_buffer);
+    tx_buffer = 0xFF;					// Load with FF to PING
+    spiTxRx(spihandle, &tx_buffer, &rx_buffer);		// Buffer should contain LSByte of test5
+    if (dbg)
+      fprintf(stderr, "LSByte = %u\t", rx_buffer);
+    test5 = (test5 << 8) | rx_buffer;			// Combine the two to make an uint16_t
     tot_ow_samples += test5;
+    if (dbg)
+      fprintf(stderr, "test5 = %u\n", test5);
   }
 
+  // Debug code
+  usleep(1);					// Small delay to ensure AVR acknowledges the command
+  tx_buffer = 0xA1;				// Load with A1 to request test2 which contains TWI error code
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
   usleep(1);					// Small delay to ensure AVR acknowledges the command
   tx_buffer = 0xFF;				// Load with FF to PING
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
+
   if (rx_buffer == 0xA1)
   {
     usleep(1);					// Short delay to allow AVR to catch up
