@@ -9,9 +9,9 @@ Commands can be entered through named pipe: ctc_cmd
 Available commands:
 -------------------
 
-A0        : Show corresponding debug variable
- |  
-AF
+A0        :
+ |        : Show corresponding debug variable
+AF        :
 
 B0        : Show I2C debug message
 
