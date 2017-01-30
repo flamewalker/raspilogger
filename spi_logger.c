@@ -1,6 +1,6 @@
 /*
  * SPI master interface to communicate with I2C datalogger
- * ver 1.1.10
+ * ver 1.2.7
  */
 
 #include <stdlib.h>
@@ -18,7 +18,7 @@
 #include <linux/types.h>			// For SPI comms
 #include <linux/spi/spidev.h>			// Spidev functions
 
-#define PROG_VER "1.1.10"			// Program version
+#define PROG_VER "1.2.7"			// Program version
 #define INT_PIN 25				// BCM pin for interrupt from AVR
 #define RESET_PIN 24				// BCM pin for reset AVR
 #define DHW_PIN 22				// BCM pin for signal DHW active
@@ -49,7 +49,7 @@ float secs = 0.0;
 // SPIDEV variables
 static const char *device = "/dev/spidev1.0";
 static uint8_t mode = 0;
-static uint32_t speed = 3000000;		// SPI speed in Hz. AVR in slave mode is only guaranteed to fosc/4 or lower, ie. 4MHz
+static uint32_t speed = 4000000;		// SPI speed in Hz. AVR in slave mode is only guaranteed to fosc/4 or lower, ie. 4MHz
 static uint8_t bits = 8;
 static uint8_t tx_buffer = 0x00;
 static uint8_t rx_buffer = 0x00;
@@ -79,6 +79,13 @@ clock_t tick_1, tick_2, tick_3;
 
 // DHW active flag
 uint8_t dhw = 0;
+
+// Union declaration for conversion of byte stream to float
+union Data
+{
+  uint8_t buf[4];
+  float number;
+};
 
 // Function declarations
 void fetch_avr_ver(void);
@@ -265,14 +272,15 @@ void fifo_reader(int signum)
   // The routine for checking if the named pipe has a command waiting
   int res, cmd, arg, data = 0;
   char str[11];
+  union Data conv;
 
-  while((res = read(readfd, str, 11)) > 0)
+  while((res = read(readfd, str, 12)) > 0)
   {
-	switch(res)
-	{
-	  case 3:		// command only (HEX)
+    switch(res)
+    {
+      case 3:		// command only (HEX)
         sscanf(str, "%x", &cmd);
-		switch(cmd)
+        switch(cmd)
         {
           case 0xB0:
             debug_msg();
@@ -300,39 +308,39 @@ void fifo_reader(int signum)
             fprintf(stderr, "DEBUG MODE: %u\n", dbg);
             if (dbg)
               debug_msg();
-		    break;
+            break;
 
-	  case 0xB3:
-		  	digitalWrite(DHW_PIN, HIGH);
-		  	fprintf(stderr, "DHW start\n");
-			dhw = 1;
-			set_temp(30);
-			dhw_start = time(NULL);
-			break;
+          case 0xB3:
+            digitalWrite(DHW_PIN, HIGH);
+            fprintf(stderr, "DHW start\n");
+            dhw = 1;
+            set_temp(30);
+            dhw_start = time(NULL);
+            break;
 
           case 0xB4:
             fetch_avr_ver();
             break;
 
           default:
-		    if (cmd >= 0xA0 && cmd <= 0xAF)
+            if (cmd >= 0xA0 && cmd <= 0xAF)
             {
-              tx_buffer = cmd;												// Load with cmd to request variable
-              spiTxRx(spihandle, &tx_buffer, &rx_buffer);						// Send first command and receive whatever is in the buffer
+              tx_buffer = cmd;							// Load with cmd to request variable
+              spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
               fprintf(stderr, "Debug_msg, expect 0xAD: %02X\n", rx_buffer);	// Should be 0xAD if previous sample was successful
-              tx_buffer = 0xFF;												// Load with 0xFF to send PING
-              spiTxRx(spihandle, &tx_buffer, &rx_buffer);						// Buffer should contain answer to previous send command
+              tx_buffer = 0xFF;							// Load with 0xFF to send PING
+              spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Buffer should contain answer to previous send command
               fprintf(stderr, "Debug_msg, cmd result=: %u\n", rx_buffer);
             }
-			else
+            else
             {
-		      fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
-			  fprintf(stderr, "FIFO_READ: Cmd: %x\n", cmd);
-			}
+              fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
+              fprintf(stderr, "FIFO_READ: Cmd: %x\n", cmd);
+            }
         }
-	    break;
+	break;
 
-	  case 6:		// command and argument (HEX HEX/UINT)
+      case 6:		// command and argument (HEX HEX/UINT)
         sscanf(str, "%x%x", &cmd, &arg);
         if (cmd >= 0xDC && cmd <= 0xDE)
           send_command(cmd, arg);
@@ -343,13 +351,55 @@ void fifo_reader(int signum)
             sscanf(str, "%x%u", &cmd, &arg);
             set_temp(arg);
           }
-	  else
+	  else if (cmd == 0xF8)
+          {
+            sscanf(str, "%x%u", &cmd, &arg);
+            tx_buffer = cmd;
+            spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+            tx_buffer = arg;
+            spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+            tx_buffer = 0xFF;
+            spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+            conv.buf[0] = rx_buffer;
+            tx_buffer = 0xFF;
+            spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+            conv.buf[1] = rx_buffer;
+            tx_buffer = 0xFF;
+            spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+            conv.buf[2] = rx_buffer;
+            tx_buffer = 0xFF;
+            spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+            conv.buf[3] = rx_buffer;
+	    fprintf(stderr, "FIFO_READ: Sensor %u calibration = %.2f\n", arg, conv.number);
+          }
+          else
 	  {
 	    fprintf(stderr, "FIFO_READ: Read failed: %u\n", res);
 	    fprintf(stderr, "FIFO_READ: Cmd: %x\tArg: %u\n", cmd, arg);
 	  }
         }
 	break;
+
+      case 10:		// Sensor calibration program: (HEX UINT FLOAT)
+      case 11:
+        sscanf(str, "%x%u%f", &cmd, &arg, &conv.number);
+        if (cmd == 0xF7)
+        {
+          tx_buffer = cmd;
+          spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+          tx_buffer = conv.buf[0];
+          spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+          tx_buffer = conv.buf[1];
+          spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+          tx_buffer = conv.buf[2];
+          spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+          tx_buffer = conv.buf[3];
+          spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+          tx_buffer = arg;
+          spiTxRx(spihandle, &tx_buffer, &rx_buffer);			// Send first command and receive whatever is in the buffer
+          fprintf(stderr, "FIFO_READ: Sensor %u calibration = %.2f\n", arg, conv.number);
+        }
+        break;
 
       default:		// possibly command, argument and data (HEX UINT UINT)
         sscanf(str, "%x%u%u", &cmd, &arg, &data);
@@ -436,10 +486,12 @@ void set_temp(uint8_t temp)
 void debug_msg(void)
 {
   fprintf(stderr, "------------------------------------------\n");
-  // Load SPI transmission buffer
-  tx_buffer = 0xA0;												// Load with A0 to request test1
+  tx_buffer = 0xF5;								// Load with F5 to enter debug fetch mode
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Send first command and receive whatever is in the buffer
   fprintf(stderr, "Debug_msg, expect 0xAF: %02X\n", rx_buffer);			// Should be 0xAF if previous sample was successful
+  tx_buffer = 0xA0;												// Load with A0 to request test1
+  spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Send first command and receive whatever is in the buffer
+  fprintf(stderr, "Debug_msg, expect 0xF5: %02X\n", rx_buffer);			// Should be 0xF5 if we're in debug fetch mode
   tx_buffer = 0xA1;												// Load with A1 to request test2
   spiTxRx(spihandle, &tx_buffer, &rx_buffer);					// Buffer should contain answer to previous send command
   fprintf(stderr, "Debug_msg, test1=: %u\n", rx_buffer);
@@ -503,10 +555,9 @@ int trySPIcon(void)
     debug_msg();
 
     // Check SPI transmission
-    tx_buffer = 0xF2;							// Load with F2 to request TWI RESET
+    tx_buffer = 0xF6;				// Load with F6 to request TWI RESET
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command, probably 0xAF if previous sample was OK
-	usleep(1);									// Short delay to allow AVR to catch up
-    tx_buffer = 0xFF;							// Load with FF to send PING
+    tx_buffer = 0xFF;				// Load with FF to send PING
     spiTxRx(spihandle, &tx_buffer, &rx_buffer);	// Buffer should contain answer to previous send command
     switch(rx_buffer)
     {
